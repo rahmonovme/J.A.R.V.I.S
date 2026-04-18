@@ -88,17 +88,23 @@ git clone https://github.com/rahmonovme/J.A.R.V.I.S.git
 cd J.A.R.V.I.S
 
 # Run the automated cross-platform setup script
-# (This will automatically download Python 3.12 via uv if needed, create a venv, and install all dependencies)
+# (Automatically downloads Python 3.12 via uv if needed, creates a venv, and installs dependencies)
+# 🪟 Windows:
 python setup.py
+# 🍎 Mac/🐧 Linux:
+python3 setup.py
 
 # Activate the virtual environment
-# Windows (PowerShell):
+# 🪟 Windows (PowerShell):
 .\venv\Scripts\Activate.ps1
-# Mac/Linux:
+# 🍎 Mac/🐧 Linux:
 source venv/bin/activate
 
 # Run JARVIS
+# 🪟 Windows:
 python main.py
+# 🍎 Mac/🐧 Linux:
+python3 main.py
 ```
 
 On first launch, a setup wizard will prompt you for your Gemini API key.
