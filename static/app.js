@@ -25,6 +25,7 @@ const COL = {
   online:   [16, 185, 129],    // emerald
   mic:      [6, 182, 212],     // teal
   micHot:   [34, 211, 238],    // bright cyan
+  sleep:    [80, 40, 160],     // dim violet
 };
 
 /* ── State ── */
@@ -152,6 +153,7 @@ function drawBg() {
 
 /* ═══════ HEALTH COLOR ═══════ */
 function getTargetColor() {
+  if (S.statusText === "SLEEPING") return COL.sleep;
   if (S.connState === "FAILED") return COL.fail;
   if (S.connState === "CONNECTING" || S.connState === "RECONNECTING") return COL.connect;
   if (S.speaking) {
@@ -418,6 +420,8 @@ function updateUI() {
   dot.className = "status-dot";
   if (S.speaking) {
     dot.classList.add("speaking"); lbl.textContent = "SPEAKING"; lbl.style.color = "#c4b5fd";
+  } else if (S.statusText === "SLEEPING") {
+    dot.classList.add("sleeping"); lbl.textContent = "SLEEPING"; lbl.style.color = "#7c3aed";
   } else if (S.connState === "CONNECTING") {
     dot.classList.add("connecting"); lbl.textContent = "CONNECTING..."; lbl.style.color = "#fbbf24";
   } else if (S.connState === "RECONNECTING") {
@@ -502,7 +506,9 @@ async function callApi(method,...args) {
   if(method==="get_settings"){wsSend({type:"get_settings"});return null;}
   if(method==="save_api_key"){wsSend({type:"save_api_key",key:args[0]});return null;}
   if(method==="setup_api_key"){wsSend({type:"setup_api_key",key:args[0]});return null;}
+  if(method==="start_session"){wsSend({type:"start_session",payload:args[0]});return null;}
   if(method==="toggle_autostart"){wsSend({type:"toggle_autostart"});return null;}
+  if(method==="sleep_mode"){wsSend({type:"sleep_mode"});return null;}
   return null;
 }
 $("btn-settings").onclick = async()=>{overlay.classList.add("active");const r=await callApi("get_settings");if(r)applySettings(r);};
@@ -544,9 +550,35 @@ function setAutoBtn(on){
 function applySettings(d){if(d.api_key)$("api-key-input").value=d.api_key;setAutoBtn(d.autostart||false);}
 
 /* ═══════ SETUP ═══════ */
+window._onSetupRequired = (data) => {
+  const overlay = document.getElementById("setup-screen");
+  if (overlay) {
+    overlay.style.display = "flex";
+    if (data && data.has_key) {
+      document.getElementById("setup-api-key").style.display = "none";
+      document.getElementById("setup-title").innerText = "AWAITING CONFIG";
+      document.getElementById("setup-desc").innerText = "Enter your primary communication language.";
+      document.getElementById("setup-btn").innerText = "START";
+    }
+  }
+};
+
 $("setup-btn").onclick=async()=>{
-  const key=$("setup-api-key").value.trim();
-  if(key){const r=await callApi("setup_api_key",key);if(r)window._onSetupOk();}
+  const lang = $("setup-language").value.trim() || "English";
+  const key  = $("setup-api-key").style.display !== "none" ? $("setup-api-key").value.trim() : null;
+  const payload = { language: lang, api_key: key };
+  const r = await callApi("start_session", payload);
+  if(r) window._onSetupOk();
+};
+
+/* ═══════ SLEEP MODE ═══════ */
+$("btn-sleep").onclick=async()=>{
+  await callApi("sleep_mode");
+};
+window._onWakeUp = function() {
+  // Backend triggers this when wake word detected
+  S.statusText = "CONNECTING";
+  S.connState = "CONNECTING";
 };
 
 /* ═══════ INIT ═══════ */

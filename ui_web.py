@@ -97,20 +97,31 @@ class _JarvisApi:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def setup_api_key(self, key):
-        key = (key or "").strip()
-        if not key:
-            return False
-        try:
-            os.makedirs(CONFIG_DIR, exist_ok=True)
-            with open(API_FILE, "w", encoding="utf-8") as f:
-                json.dump({"gemini_api_key": key}, f, indent=4)
-            self._ui._api_key_ready = True
-            self._ui.status_text = "ONLINE"
-            self._ui.write_log("SYS: Systems initialised. JARVIS online.")
-            return True
-        except Exception:
-            return False
+    def start_session(self, payload):
+        lang = payload.get("language", "English").strip()
+        key  = payload.get("api_key")
+        
+        self._ui.spoken_language = lang
+        
+        if key:
+            key = key.strip()
+            try:
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+                with open(API_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"gemini_api_key": key}, f, indent=4)
+                self._ui._api_key_ready = True
+            except Exception:
+                return False
+                
+        self._ui._language_ready = True
+        self._ui.status_text = "ONLINE"
+        self._ui.write_log(f"SYS: Systems initialised. Configuration: {lang}.")
+        return True
+
+    def sleep_mode(self):
+        """Called from JS — puts JARVIS to sleep."""
+        self._ui.enter_sleep()
+        return True
 
     def toggle_autostart(self):
         cur = self._ui._get_autostart()
@@ -194,12 +205,19 @@ class JarvisUI:
         self._conn_state    = "CONNECTING"
         self._status_text   = "INITIALISING"
         self.is_building    = False
+        self.last_audio_played_time = 0.0
 
         self._log_queue: deque = deque(maxlen=200)
         self._api_key_ready = self._api_keys_exist()
+        self._language_ready = False
+        self.spoken_language = "English"
         self._log_counter   = 0
         self._window        = None
         self._window_ready  = False
+
+        # Sleep / Wake
+        self._sleep_event    = threading.Event()   # Set when sleeping
+        self._wake_callback  = None                # Called by wake_up() to signal main.py
 
         # aiohttp server (for serving static files + WS fallback)
         self._ws_clients: list = []
@@ -267,12 +285,10 @@ class JarvisUI:
         if self._window is None:
             self._broadcast({"type": "log", **entry})
 
-        if tl.startswith("you:"):
-            self.status_text = "PROCESSING"
-            print(f"[STATE] 🔄 Status → PROCESSING")
-        elif tl.startswith("jarvis:") or tl.startswith("ai:"):
-            self.status_text = "RESPONDING"
-            print(f"[STATE] 💬 Status → RESPONDING")
+        # Status is now driven exclusively by the audio pipeline
+        # (speaking flag, _is_executing_tool, _play_audio timeout).
+        # Do NOT set status_text here — it caused race conditions
+        # where log-driven status overwrote pipeline-driven status.
 
     def start_speaking(self):
         self.speaking    = True
@@ -285,10 +301,58 @@ class JarvisUI:
         print(f"[STATE] 🔇 Speaking → OFF | Status → ONLINE")
 
     def wait_for_api_key(self):
-        print(f"[STATE] 🔑 Waiting for API key...")
-        while not self._api_key_ready:
+        print(f"[STATE] 🔑 Waiting for session configuration...")
+        while not (self._api_key_ready and self._language_ready):
             time.sleep(0.1)
-        print(f"[STATE] ✅ API key found")
+        print(f"[STATE] ✅ Session configured")
+
+    # ── Sleep / Wake ──
+    def enter_sleep(self):
+        """Put JARVIS to sleep — minimize window, signal main.py to disconnect."""
+        self._sleep_event.set()
+        self.status_text = "SLEEPING"
+        self.conn_state  = "CONNECTING"  # Will show SLEEPING due to statusText priority
+        self.speaking    = False
+        self.mic_level   = 0.0
+        self.jarvis_level = 0.0
+        self.write_log("SYS: Entering sleep mode. Say 'wake up' to resume.")
+        print("[STATE] 😴 Entering SLEEP mode")
+
+        # Minimize window
+        if self._window:
+            try:
+                self._window.minimize()
+            except Exception as e:
+                print(f"[UI] ⚠️ Minimize failed: {e}")
+
+    def wake_up(self):
+        """Wake JARVIS — restore window, signal main.py to reconnect."""
+        self._sleep_event.clear()
+        self.status_text = "CONNECTING"
+        self.conn_state  = "CONNECTING"
+        self.write_log("SYS: Wake word detected. Reconnecting...")
+        print("[STATE] ☀️ WAKING UP")
+
+        # Restore window
+        if self._window:
+            try:
+                self._window.restore()
+                self._window.on_top = True
+                time.sleep(0.3)
+                self._window.on_top = False
+            except Exception as e:
+                print(f"[UI] ⚠️ Restore failed: {e}")
+
+        # Notify JS
+        self._eval_js("_onWakeUp()")
+
+        # Trigger reconnect callback in main.py
+        if self._wake_callback:
+            self._wake_callback()
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleep_event.is_set()
 
     # ── evaluate_js wrapper ──
     def _eval_js(self, code):
@@ -305,9 +369,10 @@ class JarvisUI:
             time.sleep(1.5)  # Wait for page + JS to fully load
             self._window_ready = True
 
-            # Send initial setup_required if needed
-            if not self._api_key_ready:
-                self._eval_js("_onSetupRequired()")
+            # Always mandate the Setup screen on component load
+            # It will dynamically hide the API key field if _api_key_ready is already True
+            safe_has_key = str(self._api_key_ready).lower()
+            self._eval_js(f"_onSetupRequired({{'has_key': {safe_has_key}}})")
 
             # Replay existing logs (only those queued before window was ready)
             for entry in list(self._log_queue):
@@ -382,8 +447,8 @@ class JarvisUI:
             "status_text": self.status_text,
             "is_building": self.is_building,
         })
-        if not self._api_key_ready:
-            await ws.send_json({"type": "setup_required"})
+        await ws.send_json({"type": "setup_required", "has_key": self._api_key_ready})
+
         for entry in list(self._log_queue):
             await ws.send_json({"type": "log", **entry})
 
@@ -423,20 +488,30 @@ class JarvisUI:
                 await ws.send_json({"type": "save_result", "success": True})
             except Exception as e:
                 await ws.send_json({"type": "save_result", "success": False, "error": str(e)})
-        elif t == "setup_api_key":
-            key = d.get("key", "").strip()
+        elif t == "start_session":
+            payload = d.get("payload", {})
+            lang = payload.get("language", "English").strip()
+            key  = payload.get("api_key")
+            
+            self.spoken_language = lang
+            
             if key:
+                key = key.strip()
                 os.makedirs(CONFIG_DIR, exist_ok=True)
                 with open(API_FILE, "w", encoding="utf-8") as f:
                     json.dump({"gemini_api_key": key}, f, indent=4)
                 self._api_key_ready = True
-                self._broadcast({"type": "setup_ok"})
-                self.status_text = "ONLINE"
-                self.write_log("SYS: Systems initialised. JARVIS online.")
+                
+            self._language_ready = True
+            self._broadcast({"type": "setup_ok"})
+            self.status_text = "ONLINE"
+            self.write_log(f"SYS: Systems initialised. Configuration: {lang}.")
         elif t == "toggle_autostart":
             cur = self._get_autostart()
             ok  = self._set_autostart(not cur)
             await ws.send_json({"type": "autostart_result", "enabled": (not cur) if ok else cur})
+        elif t == "sleep_mode":
+            self.enter_sleep()
 
     async def _broadcast_async(self, data):
         dead = []

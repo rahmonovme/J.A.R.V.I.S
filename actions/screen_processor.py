@@ -70,15 +70,18 @@ IMG_MAX_W = 640
 IMG_MAX_H = 360
 JPEG_Q    = 55
 
-SYSTEM_PROMPT = (
-    "You are JARVIS from Iron Man movies. "
-    "Analyze images with technical precision and intelligence. "
-    "Help the user in a way they can understand — don't be overly complex. "
-    "Be concise, smart, and helpful like Tony Stark's AI assistant. "
-    "Respond in maximum 2 short sentences. Speed is priority. "
-    "Address the user as 'sir' for a tone of respect. "
-    "Ask if the user needs any further help with their problem."
-)
+def _build_vision_prompt(language: str = "English") -> str:
+    return (
+        "You are JARVIS from Iron Man movies. "
+        "Analyze images with technical precision and intelligence. "
+        "Help the user in a way they can understand — don't be overly complex. "
+        "Be concise, smart, and helpful like Tony Stark's AI assistant. "
+        "Respond in maximum 2 short sentences. Speed is priority. "
+        "Address the user as 'sir' for a tone of respect. "
+        "Ask if the user needs any further help with their problem. "
+        f"CRITICAL: You MUST respond ONLY in {language}. "
+        f"Never respond in English unless {language} IS English."
+    )
 
 
 def _get_api_key() -> str:
@@ -234,20 +237,24 @@ class _LiveSession:
             http_options={"api_version": "v1beta"}
         )
 
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            system_instruction=SYSTEM_PROMPT,
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
-                    )
-                )
-            ),
-        )
-
         while True:
+            # Rebuild config each connection to pick up language changes
+            lang = "English"
+            if self._player and hasattr(self._player, 'spoken_language'):
+                lang = self._player.spoken_language or "English"
+
+            config = types.LiveConnectConfig(
+                response_modalities=["AUDIO"],
+                output_audio_transcription={},
+                system_instruction=_build_vision_prompt(lang),
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name="Charon"
+                        )
+                    )
+                ),
+            )
             try:
                 print("[ScreenProcess] 🔌 Vision session connecting...")
                 async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
@@ -321,6 +328,7 @@ class _LiveSession:
             await asyncio.sleep(0.3)
 
     async def _play_loop(self):
+        import time
         stream = await asyncio.to_thread(
             self._pya.open,
             format=FORMAT, channels=CHANNELS,
@@ -328,10 +336,27 @@ class _LiveSession:
         )
         try:
             while True:
-                chunk = await self._audio_in.get()
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._audio_in.get(), timeout=0.3
+                    )
+                except asyncio.TimeoutError:
+                    if self._player and self._player.speaking:
+                        if (time.time() - getattr(self._player, 'last_audio_played_time', 0)) > 0.8:
+                            self._player.speaking = False
+                            self._player.status_text = "ONLINE"
+                    continue
+                    
+                if self._player:
+                    self._player.speaking = True
+                    self._player.status_text = "RESPONDING"
+                    self._player.last_audio_played_time = time.time()
                 await asyncio.to_thread(stream.write, chunk)
         finally:
             stream.close()
+            if self._player:
+                self._player.speaking = False
+                self._player.status_text = "ONLINE"
 
     def analyze(self, image_bytes: bytes, mime_type: str, user_text: str):
         """Called from main thread — puts image into async queue."""

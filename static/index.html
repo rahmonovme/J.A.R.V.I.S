@@ -29,6 +29,11 @@
     </div>
     <div class="header-right">
       <span class="header-clock" id="clock">00:00:00</span>
+      <button class="hdr-btn" id="btn-sleep" title="Sleep Mode">
+        <svg viewBox="0 0 24 24">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/>
+        </svg>
+      </button>
       <button class="hdr-btn" id="btn-settings" title="Settings">
         <svg viewBox="0 0 24 24">
           <circle cx="12" cy="12" r="3"/>
@@ -143,8 +148,9 @@
   <div class="setup-overlay" id="setup-screen" style="display:none">
     <div class="setup-card">
       <div class="setup-orb"></div>
-      <div class="setup-title">INITIALISATION</div>
-      <div class="setup-desc">Enter your Gemini API key to boot J.A.R.V.I.S.</div>
+      <div class="setup-title" id="setup-title">INITIALISATION</div>
+      <div class="setup-desc" id="setup-desc">Configure JARVIS for boot.</div>
+      <input type="text" class="setup-input" id="setup-language" placeholder="Spoken Language (e.g. English, Türkçe)..." />
       <input type="password" class="setup-input" id="setup-api-key" placeholder="Gemini API Key..." />
       <button class="setup-btn" id="setup-btn">INITIALISE</button>
     </div>

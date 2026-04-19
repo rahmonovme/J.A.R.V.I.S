@@ -204,10 +204,24 @@ html, body {
   background: var(--err);
   box-shadow: 0 0 10px rgba(var(--err-rgb), 0.6);
 }
+.status-dot.sleeping {
+  background: #6d28d9;
+  box-shadow: 0 0 8px rgba(109, 40, 217, 0.4);
+  animation: dot-sleep 3s ease-in-out infinite;
+}
 
 @keyframes dot-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.4; transform: scale(0.6); }
+}
+@keyframes dot-sleep {
+  0%, 100% { opacity: 0.5; transform: scale(0.8); }
+  50% { opacity: 0.15; transform: scale(0.5); }
+}
+
+#btn-sleep:hover svg {
+  stroke: #a78bfa;
+  filter: drop-shadow(0 0 6px rgba(139, 92, 246, 0.5));
 }
 
 /* ── Mic Waveform (horizontal) ── */

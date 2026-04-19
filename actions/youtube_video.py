@@ -482,11 +482,30 @@ def _handle_trending(parameters: dict, player, speak) -> str:
     return result
 
 
+def _handle_open_home(parameters: dict, player) -> str:
+    import webbrowser
+    webbrowser.open("https://www.youtube.com")
+    if player:
+        player.write_log("[YouTube] Opened homepage.")
+    return "Opened YouTube homepage, sir."
+
+def _handle_library(parameters: dict, player) -> str:
+    """Navigate directly to YouTube Library / Saved Playlists."""
+    import webbrowser
+    webbrowser.open("https://www.youtube.com/feed/playlists")
+    time.sleep(3.0)
+    if player:
+        player.write_log("[YouTube] Opened saved playlists.")
+    return "Opened your YouTube saved playlists page, sir. Your playlists are now visible."
+
+
 _ACTION_MAP = {
     "play":      _handle_play,
     "summarize": _handle_summarize,
     "get_info":  _handle_get_info,
     "trending":  _handle_trending,
+    "open_home": _handle_open_home,
+    "library":   _handle_library,
 }
 
 def youtube_video(
@@ -508,12 +527,16 @@ def youtube_video(
                     parameters: url(str, optional — dialog if omitted)
         trending  : Show trending videos
                     parameters: region(str, default "TR") — ISO country code
+        open_home : Open YouTube homepage passively
+                    parameters: None
+        library   : Open saved playlists / library page
+                    parameters: None
 
     Agent chain:
         summarize can be chained after any action that produces a YouTube URL.
     """
     params = parameters or {}
-    action = params.get("action", "play").lower().strip()
+    action = params.get("action", "open_home").lower().strip()
 
     if player:
         player.write_log(f"[YouTube] Action: {action}")
@@ -522,10 +545,10 @@ def youtube_video(
 
     handler = _ACTION_MAP.get(action)
     if handler is None:
-        return f"Unknown YouTube action: '{action}'. Available: play, summarize, get_info, trending."
+        return f"Unknown YouTube action: '{action}'. Available: play, summarize, get_info, trending, open_home."
 
     try:
-        if action == "play":
+        if action in ["play", "open_home", "library"]:
             return handler(params, player) or "Done."
         return handler(params, player, speak) or "Done."
 

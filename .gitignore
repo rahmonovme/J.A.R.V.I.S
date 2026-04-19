@@ -13,6 +13,7 @@ env/
 
 # API Keys & Secrets
 config/api_keys.json
+config/api_limits.json
 secrets.json
 
 # OS generated files

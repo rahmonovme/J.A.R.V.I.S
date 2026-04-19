@@ -269,7 +269,10 @@ TOOL_DECLARATIONS = [
     "name": "youtube_video",
     "description": (
         "Controls YouTube — opens browser and navigates automatically. "
-        "Use for: playing videos/music, summarizing videos, showing trending. "
+        "Use for: playing videos/music, summarizing videos, showing trending, "
+        "opening saved playlists/library. "
+        "When user wants their saved playlists or library, use action='library'. "
+        "NEVER use agent_task or browser_control for YouTube — this tool handles EVERYTHING. "
         "NEVER open browser or YouTube app first — this tool handles everything. "
         "After playing, do NOT close the browser — leave the video/music running."
     ),
@@ -278,9 +281,9 @@ TOOL_DECLARATIONS = [
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "play | summarize | get_info | trending (default: play)"
+                "description": "play | summarize | get_info | trending | open_home | library (default: open_home). Use 'library' when user wants saved playlists, liked videos, or their YouTube library."
             },
-            "query":  {"type": "STRING", "description": "Search query — be SPECIFIC, never vague like 'some music'"},
+            "query":  {"type": "STRING", "description": "Search query — be SPECIFIC, never vague like 'some music'. Emtpy when open_home."},
             "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
             "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
             "url":    {"type": "STRING", "description": "Video URL for get_info action"},
@@ -544,7 +547,8 @@ class JarvisLive:
         self.audio_in_queue = None
         self.out_queue      = None
         self._loop          = None
-        self._mic_muted     = False
+        self._is_executing_tool = False
+        self._bg_tasks_active   = 0     # Track background agent_task count
 
     def speak(self, text: str):
         """Thread-safe speak — any thread can call this."""
@@ -579,6 +583,17 @@ class JarvisLive:
             sys_prompt = time_ctx + mem_str + "\n\n" + sys_prompt
         else:
             sys_prompt = time_ctx + sys_prompt
+            
+        sys_prompt += (
+            f"\n\n[LANGUAGE DIRECTIVE — ABSOLUTE PRIORITY]"
+            f"\nThe user has selected '{self.ui.spoken_language}' as the communication language."
+            f"\n1. You MUST speak exclusively in {self.ui.spoken_language}."
+            f"\n2. ALL tool call arguments (descriptions, text fields, queries) MUST be in {self.ui.spoken_language} — NEVER in English."
+            f"\n   Example: screen_process text must be '{self.ui.spoken_language}', NOT English."
+            f"\n3. When transcribing the user's speech, ALWAYS use LATIN script (a-z characters)."
+            f"\n   NEVER use Arabic, Cyrillic, or other non-Latin scripts for {self.ui.spoken_language}."
+            f"\n   Example: Write 'Salom' NOT 'سلام', write 'Telegramni och' NOT 'تلگرامنی اوچ'."
+        )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -604,6 +619,10 @@ class JarvisLive:
 
         loop   = asyncio.get_event_loop()
         result = "Done."
+
+        self._is_executing_tool = True
+        if self.ui:
+            self.ui.status_text = "PROCESSING"
 
         try:
             if name == "open_app":
@@ -659,8 +678,9 @@ class JarvisLive:
                     daemon=True
                 ).start()
                 result = (
-                    "Vision module activated. "
-                    "Stay completely silent — vision module will speak directly."
+                    "Vision module activated and will speak the answer directly to the user via audio. "
+                    "You MUST NOT generate ANY audio response. Do NOT speak. Do NOT say anything. "
+                    "Remain COMPLETELY SILENT. The vision module handles the entire reply."
                 )
 
             elif name == "computer_settings":
@@ -714,10 +734,18 @@ class JarvisLive:
                 priority = priority_map.get(priority_str, TaskPriority.NORMAL)
 
                 queue   = get_queue()
+                self._bg_tasks_active += 1
+
+                def _on_task_done(task_id_done, result_done):
+                    self._bg_tasks_active = max(0, self._bg_tasks_active - 1)
+                    if self._bg_tasks_active == 0 and not self._is_executing_tool:
+                        self.ui.status_text = "ONLINE"
+
                 task_id = queue.submit(
                     goal=goal,
                     priority=priority,
                     speak=self.speak,
+                    on_complete=_on_task_done,
                 )
                 result = f"Task started (ID: {task_id}). I'll update you as I make progress, sir."
 
@@ -744,6 +772,8 @@ class JarvisLive:
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
+        finally:
+            self._is_executing_tool = False
 
         print(f"[JARVIS] 📤 {name} → {result[:80]}")
 
@@ -777,8 +807,10 @@ class JarvisLive:
                 
                 rms = 0.0
                 
-                # Echo cancellation: target silence when JARVIS is speaking
-                if self._mic_muted or getattr(self.ui, 'is_building', False):
+                # Echo cancellation: strictly suppress microphone if speaker has recently output acoustic energy
+                # A robust 1.0 second decay padding guarantees trailing hardware DAC buffers won't loop back in.
+                # AND strictly suppress if an automated Tool is actively processing!
+                if self._is_executing_tool or getattr(self.ui, 'is_building', False) or (self.ui and time.time() - self.ui.last_audio_played_time < 1.0):
                     data = b'\x00' * len(data)
                     self.ui.mic_level = 0.0
                 else:
@@ -812,6 +844,7 @@ class JarvisLive:
         print("[JARVIS] 👂 Recv started")
         out_buf = []
         in_buf  = []
+        _in_logged = False  # Track whether user speech was already logged
 
         try:
             while True:
@@ -828,6 +861,11 @@ class JarvisLive:
                             txt = sc.input_transcription.text.strip()
                             if txt:
                                 in_buf.append(txt)
+                                # Log user speech IMMEDIATELY — don't wait for turn_complete
+                                if not _in_logged:
+                                    self.ui.write_log(f"You: {txt}")
+                                    self.ui.status_text = "PROCESSING"
+                                    _in_logged = True
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = sc.output_transcription.text.strip()
@@ -835,14 +873,12 @@ class JarvisLive:
                                 out_buf.append(txt)
 
                         if sc.turn_complete:
-                            full_in  = ""
+                            full_in  = " ".join(in_buf).strip() if in_buf else ""
                             full_out = ""
 
-                            if in_buf:
-                                full_in = " ".join(in_buf).strip()
-                                if full_in:
-                                    self.ui.write_log(f"You: {full_in}")
+                            # User speech was already logged immediately above — skip
                             in_buf = []
+                            _in_logged = False
 
                             if out_buf:
                                 full_out = " ".join(out_buf).strip()
@@ -889,15 +925,18 @@ class JarvisLive:
                     )
                 except asyncio.TimeoutError:
                     if self.ui.speaking:
-                        self.ui.speaking = False
-                        self.ui.jarvis_level = 0.0
-                        self.ui.status_text = "ONLINE"
-                    if self._mic_muted:
-                        await asyncio.sleep(0.15)
-                        self._mic_muted = False
+                        # Allow UI visuals to decay only if hardware buffer is completely 100% finished
+                        if (time.time() - self.ui.last_audio_played_time) > 0.8:
+                            self.ui.speaking = False
+                            self.ui.jarvis_level = 0.0
+                            if not self._is_executing_tool and self._bg_tasks_active == 0:
+                                self.ui.status_text = "ONLINE"
                     continue
-                self._mic_muted = True
+                
+                if self.ui:
+                    self.ui.last_audio_played_time = time.time()
                 self.ui.speaking = True
+                self.ui.status_text = "RESPONDING"
                 # Calculate JARVIS voice level for UI visualizer
                 try:
                     n = len(chunk) // 2
@@ -924,7 +963,27 @@ class JarvisLive:
         max_backoff = 60
         consecutive_failures = 0
 
+        # Register wake callback so UI can signal us
+        self._wake_event = asyncio.Event()
+
+        def _on_wake():
+            """Called from UI thread when wake word detected."""
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._wake_event.set)
+
+        self.ui._wake_callback = _on_wake
+
         while True:
+            # ── SLEEP GATE: if sleeping, wait for wake ──
+            if self.ui.is_sleeping:
+                print("[JARVIS] 😴 Session sleeping — starting wake listener...")
+                self._start_wake_listener()
+                # Block async loop until wake
+                self._wake_event.clear()
+                await self._wake_event.wait()
+                print("[JARVIS] ☀️ Wake signal received — reconnecting...")
+                continue
+
             try:
                 self.ui.conn_state = "CONNECTING"
                 self.ui.status_text = "CONNECTING"
@@ -945,12 +1004,27 @@ class JarvisLive:
                     print("[JARVIS] ✅ Connected.")
                     self.ui.write_log("SYS: JARVIS online.")
 
-                    await asyncio.gather(
-                        self._send_realtime(),
-                        self._listen_audio(),
-                        self._receive_audio(),
-                        self._play_audio()
+                    # Run until session ends or sleep is triggered
+                    tasks = [
+                        asyncio.create_task(self._send_realtime()),
+                        asyncio.create_task(self._listen_audio()),
+                        asyncio.create_task(self._receive_audio()),
+                        asyncio.create_task(self._play_audio()),
+                        asyncio.create_task(self._sleep_watcher()),
+                    ]
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_EXCEPTION
                     )
+                    for t in pending:
+                        t.cancel()
+                    # Check if sleep was triggered
+                    if self.ui.is_sleeping:
+                        print("[JARVIS] 😴 Sleep triggered — disconnecting session...")
+                        continue
+                    # Re-raise any real exceptions
+                    for t in done:
+                        if t.exception():
+                            raise t.exception()
 
             except Exception as e:
                 consecutive_failures += 1
@@ -958,6 +1032,9 @@ class JarvisLive:
                 traceback.print_exc()
 
             # ── Exponential backoff with connection state ──
+            if self.ui.is_sleeping:
+                continue  # Skip backoff, go straight to sleep gate
+
             if consecutive_failures >= 5:
                 self.ui.conn_state = "FAILED"
                 self.ui.status_text = "FAILED"
@@ -973,6 +1050,71 @@ class JarvisLive:
                   f"(attempt {consecutive_failures})...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
+
+    async def _sleep_watcher(self):
+        """Polls for sleep event — cancels session when sleep is triggered."""
+        while True:
+            await asyncio.sleep(0.3)
+            if self.ui.is_sleeping:
+                raise asyncio.CancelledError("Sleep triggered")
+
+    def _start_wake_listener(self):
+        """Start a background thread that listens for 'wake up' using speech_recognition."""
+        threading.Thread(
+            target=self._wake_listener_loop,
+            daemon=True,
+            name="WakeWordListener"
+        ).start()
+
+    def _wake_listener_loop(self):
+        """Lightweight wake-word detection using speech_recognition + Google."""
+        try:
+            import speech_recognition as sr
+        except ImportError:
+            print("[WAKE] ⚠️ speech_recognition not installed. Cannot listen for wake word.")
+            print("[WAKE] Install with: pip install SpeechRecognition")
+            # Fallback: just wait indefinitely (user must restart manually)
+            return
+
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = 300
+        recognizer.dynamic_energy_threshold = True
+        recognizer.pause_threshold = 0.8
+
+        mic = sr.Microphone()
+        print("[WAKE] 🎤 Wake listener active — say 'wake up' to resume...")
+
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+
+        while self.ui.is_sleeping:
+            try:
+                with mic as source:
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=3)
+
+                try:
+                    text = recognizer.recognize_google(audio, language="en-US").lower().strip()
+                    print(f"[WAKE] 👂 Heard: '{text}'")
+
+                    # Check for wake phrase
+                    if "wake up" in text or "wake" in text.split():
+                        print("[WAKE] ✅ Wake word detected!")
+                        self.ui.wake_up()
+                        return
+                except sr.UnknownValueError:
+                    pass  # Didn't understand — keep listening
+                except sr.RequestError as e:
+                    print(f"[WAKE] ⚠️ Speech API error: {e}")
+                    time.sleep(2)
+
+            except sr.WaitTimeoutError:
+                pass  # No speech detected in timeout window — keep listening
+            except Exception as e:
+                print(f"[WAKE] ⚠️ Listener error: {e}")
+                time.sleep(1)
+
+        print("[WAKE] 🔇 Wake listener stopped (no longer sleeping)")
+
 
 def main():
     ui = JarvisUI()

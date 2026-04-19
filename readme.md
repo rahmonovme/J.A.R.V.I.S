@@ -1,7 +1,7 @@
 # J.A.R.V.I.S
 
 **Just A Rather Very Intelligent System**  
-An advanced AI personal assistant powered by Google Gemini Live API with real-time voice interaction, smart task execution, and multi-monitor awareness.
+An advanced AI personal assistant powered by Google Gemini Live API with real-time voice interaction, smart task execution, multi-monitor awareness, and voice-activated wake word detection.
 
 ---
 
@@ -11,6 +11,14 @@ An advanced AI personal assistant powered by Google Gemini Live API with real-ti
 - Full-duplex audio: listen and speak simultaneously
 - Gemini Live API integration for natural conversation
 - Audio echo cancellation: mic auto-mutes during JARVIS playback to prevent feedback loops
+- **Multi-language support** — select your spoken language at boot (Uzbek, Turkish, English, etc.)
+- Latin-script transcription enforcement for non-Latin languages
+
+### 😴 Sleep & Wake Mode
+- **One-click sleep** — moon button in header disconnects AI and minimizes the window
+- **Voice-activated wake** — say "wake up" to restore the window and reconnect
+- Lightweight wake-word listener using Google Speech Recognition (no API quota consumed)
+- Automatic session reconnection after wake
 
 ### 🧠 Smart Task Execution (Agent System)
 - Multi-step task planning with Gemini-powered planner
@@ -25,10 +33,13 @@ An advanced AI personal assistant powered by Google Gemini Live API with real-ti
 - Arc-Reactor inspired JARVIS voice visualizer (cyan, circular).
 - Frequency-bar circle microphone visualizer (amber).
 - **Connection status indicators** — center animation changes color:
-  - 🟦 **Cyan** = Online
+  - 🟣 **Violet** = Idle
+  - 🟦 **Cyan** = Processing
+  - 💜 **Lavender** = Speaking
   - 🟡 **Amber** = Connecting
   - 🟠 **Orange** = Reconnecting
   - 🔴 **Red** = Connection Failed
+  - 🌙 **Dim Violet** = Sleeping
 - Animated grid, scanline, rotating arcs, and pulse rings
 - Corner HUD data readouts (uptime, system status)
 - Real-time clock display
@@ -46,10 +57,11 @@ An advanced AI personal assistant powered by Google Gemini Live API with real-ti
 - Exponential backoff on connection failures (3s → 60s cap).
 - Graceful handling of WebSocket keep-alive network errors.
 
-### 📱 Smart Messaging
+### 📱 Smart Messaging & Media
 - WhatsApp, Telegram, Instagram direct messaging
 - pyperclip integration for Unicode contact names
 - Platform-specific contact search patterns
+- **YouTube controller** — play, search, summarize, trending, and open saved playlists/library
 
 ---
 
