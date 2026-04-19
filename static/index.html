@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
   <title>J.A.R.V.I.S</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 </head>
 <body>
 <div id="app">
@@ -14,13 +15,6 @@
   <header class="header">
     <div class="header-left">
       <div class="logo">
-        <svg class="logo-icon" viewBox="0 0 24 24">
-          <path d="M12 2a7 7 0 0 0-7 7c0 2.38 1.19 4.47 3 5.74V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.26c1.81-1.27 3-3.36 3-5.74a7 7 0 0 0-7-7z"/>
-          <line x1="10" y1="22" x2="14" y2="22"/>
-          <line x1="9" y1="9" x2="12" y2="12"/>
-          <line x1="15" y1="9" x2="12" y2="12"/>
-          <line x1="12" y1="12" x2="12" y2="16"/>
-        </svg>
         <span class="logo-text">J.A.R.V.I.S</span>
       </div>
     </div>
@@ -103,7 +97,13 @@
           <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
+      <div class="modal-tabs">
+        <button class="tab-btn active" data-tab="tab-general">GENERAL</button>
+        <button class="tab-btn" data-tab="tab-models">MODELS</button>
+      </div>
       <div class="modal-body">
+        <!-- GENERAL TAB -->
+        <div class="tab-content active" id="tab-general">
         <div class="modal-section">
           <div class="modal-section-title">
             <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -126,6 +126,18 @@
         </div>
         <div class="modal-section">
           <div class="modal-section-title">
+            <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+            LANGUAGE PREFERENCE
+          </div>
+          <div class="field-label">Configure the language JARVIS uses for interaction.</div>
+          <button class="btn" id="btn-change-language" style="margin-top:8px;">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            CHANGE LANGUAGE
+          </button>
+        </div>
+
+        <div class="modal-section">
+          <div class="modal-section-title">
             <svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
             STARTUP
           </div>
@@ -135,6 +147,28 @@
               <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;stroke-width:2;fill:none"><circle cx="12" cy="12" r="10"/></svg>
               OFF
             </button>
+          </div>
+        </div>
+        </div>
+
+        <!-- MODELS TAB -->
+        <div class="tab-content" id="tab-models">
+          <div class="modal-section">
+            <div class="modal-section-title" style="display:flex;justify-content:space-between;align-items:center;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+                DYNAMIC INVENTORY
+              </div>
+              <button class="btn btn-sm" id="btn-scan-models" title="Refresh local inventory">
+                <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-9 9m9-9a9 9 0 0 0-9-9m9 9H3m9 9a9 9 0 0 1-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9"/></svg>
+                SYNC MODELS
+              </button>
+            </div>
+            
+            <div id="model-list-container">
+              <div class="loader-ring"></div>
+              <div style="text-align:center;padding:20px;opacity:0.6;">Scanning available engines...</div>
+            </div>
           </div>
         </div>
       </div>

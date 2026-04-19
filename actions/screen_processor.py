@@ -60,7 +60,8 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+from core.gemini_client import ModelRegistry, _mark_model_exhausted
+_DEFAULT_VISION     = "models/gemini-3.1-flash-live-preview"
 FORMAT              = pyaudio.paInt16
 CHANNELS            = 1
 RECEIVE_SAMPLE_RATE = 24000
@@ -256,16 +257,28 @@ class _LiveSession:
                 ),
             )
             try:
-                print("[ScreenProcess] 🔌 Vision session connecting...")
-                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-                    self._session = session
-                    self._ready.set()
-                    print("[ScreenProcess] ✅ Vision session connected")
-
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self._send_loop())
-                        tg.create_task(self._recv_loop())
-                        tg.create_task(self._play_loop())
+                models_to_try = ModelRegistry.get_vision_chain(_DEFAULT_VISION)
+                session = None
+                for idx, m in enumerate(models_to_try):
+                    try:
+                        print(f"[ScreenProcess] 🔌 Vision session connecting to {m}...")
+                        async with client.aio.live.connect(model=m, config=config) as sess:
+                            session = sess
+                            print(f"[ScreenProcess] ✅ Vision session connected to {m}")
+                            self._session = session
+                            self._ready.set()
+                            async with asyncio.TaskGroup() as tg:
+                                tg.create_task(self._send_loop())
+                                tg.create_task(self._recv_loop())
+                                tg.create_task(self._play_loop())
+                            break # Exited safely or failed internally
+                    except Exception as e:
+                        err_msg = str(e).lower()
+                        if "429" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
+                            _mark_model_exhausted(m)
+                            if idx < len(models_to_try) - 1:
+                                continue # Try next model
+                        raise # Permanent failure
 
             except Exception as e:
                 print(f"[ScreenProcess] ⚠️ Disconnected: {e} — reconnecting...")
@@ -344,7 +357,13 @@ class _LiveSession:
                     if self._player and self._player.speaking:
                         if (time.time() - getattr(self._player, 'last_audio_played_time', 0)) > 0.8:
                             self._player.speaking = False
-                            self._player.status_text = "ONLINE"
+                            
+                            is_tool = getattr(self._player, '_is_executing_tool', False)
+                            bg_tasks = getattr(self._player, '_bg_tasks_active', 0)
+                            if not is_tool and bg_tasks == 0:
+                                self._player.status_text = "ONLINE"
+                            elif bg_tasks > 0 or is_tool:
+                                self._player.status_text = "PROCESSING"
                     continue
                     
                 if self._player:
@@ -361,7 +380,12 @@ class _LiveSession:
             stream.close()
             if self._player:
                 self._player.speaking = False
-                self._player.status_text = "ONLINE"
+                is_tool = getattr(self._player, '_is_executing_tool', False)
+                bg_tasks = getattr(self._player, '_bg_tasks_active', 0)
+                if not is_tool and bg_tasks == 0:
+                    self._player.status_text = "ONLINE"
+                elif bg_tasks > 0 or is_tool:
+                    self._player.status_text = "PROCESSING"
 
     def analyze(self, image_bytes: bytes, mime_type: str, user_text: str):
         """Called from main thread — puts image into async queue."""

@@ -27,6 +27,8 @@ An advanced AI personal assistant powered by Google Gemini Live API with real-ti
 - Screen verification after critical actions (verifies apps actually launched)
 - Multi-monitor awareness for screen analysis and interaction
 - Cross-platform support for Windows, macOS, and Linux out of the box.
+- **Native Win32 Window Management** — Move, resize, and manage windows across multiple monitors using direct OS calls instead of hotkeys.
+- **Universal AI Bluetooth LED Control** — Autodiscovery and control of generic RGB strips using Gemini AI to identify devices from scans.
 
 ### 🖥️ Premium Web-Native HUD Interface
 - High-performance glassmorphism UI rendered via WebViews (Flask backend).
@@ -185,6 +187,7 @@ J.A.R.V.I.S/
 │   └── error_handler.py     # Error recovery with auto-replanning
 └── actions/                 # Modular autonomous tools
     ├── computer_control.py  # High-precision Active-Window coordinate tracking
+    ├── bluetooth_control.py # Universal AI-driven Bluetooth LED controller
     ├── screen_processor.py  # Visual analysis engine
     ├── open_app.py          # Smart multi-strategy native launcher
     ├── web_search.py        # Web search integration

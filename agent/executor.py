@@ -61,7 +61,7 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
 
     try:
         prompt = f"Write Python to accomplish this task:\n{description}"
-        code = ask(prompt, model="gemini-2.5-flash", system_instruction=system_instruction)
+        code = ask(prompt, system_instruction=system_instruction)
         code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
 
         with tempfile.NamedTemporaryFile(
@@ -127,8 +127,7 @@ def _detect_language(text: str) -> str:
         return ask(
             f"What language is this text written in? "
             f"Reply with ONLY the language name in English (e.g. Turkish, English, French).\n\n"
-            f"Text: {text[:200]}",
-            model="gemini-2.5-flash-lite"
+            f"Text: {text[:200]}"
         )
     except Exception:
         return "English"
@@ -153,7 +152,7 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
             f"- Output ONLY the translated text, nothing else\n\n"
             f"Text to translate:\n{content[:4000]}"
         )
-        translated = ask(prompt, model="gemini-2.5-flash")
+        translated = ask(prompt)
         print(f"[Executor] ✅ Translation done ({target_lang})")
         return translated
     except Exception as e:
@@ -233,6 +232,10 @@ def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
         from actions.flight_finder import flight_finder
         return flight_finder(parameters=parameters, player=None, speak=speak) or "Done."
 
+    elif tool == "bluetooth_control":
+        from actions.bluetooth_control import bluetooth_control
+        return bluetooth_control(parameters=parameters) or "Done."
+
     else:
         print(f"[Executor] ⚠️ Unknown tool '{tool}' — falling back to generated_code")
         return _run_generated_code(f"Accomplish this task: {parameters}", speak=speak)
@@ -246,8 +249,11 @@ class AgentExecutor:
         goal:        str,
         speak:       Callable | None        = None,
         cancel_flag: threading.Event | None = None,
+        ui_status_callback: Callable | None = None,
     ) -> str:
         print(f"\n[Executor] 🎯 Goal: {goal}")
+        if ui_status_callback:
+            ui_status_callback("Planning task...")
 
         replan_attempts = 0
         completed_steps = []
@@ -256,6 +262,8 @@ class AgentExecutor:
 
         while True:
             steps = plan.get("steps", [])
+            # Total steps includes already completed ones + remaining ones in current plan
+            total_steps = len(steps) + len(completed_steps)
 
             if not steps:
                 err = str(plan.get("error", ""))
@@ -274,7 +282,7 @@ class AgentExecutor:
             failed_step  = None
             failed_error = ""
 
-            for step in steps:
+            for idx, step in enumerate(steps):
                 if cancel_flag and cancel_flag.is_set():
                     if speak: speak("Task cancelled, sir.")
                     return "Task cancelled."
@@ -286,7 +294,11 @@ class AgentExecutor:
 
                 params = _inject_context(params, tool, step_results, goal=goal)
 
-                print(f"\n[Executor] ▶️ Step {step_num}: [{tool}] {desc}")
+                curr_idx = len(completed_steps) + 1
+                progress_msg = f"Step {curr_idx}/{total_steps}: {desc[:40]}"
+                print(f"\n[Executor] ▶️ {progress_msg}")
+                if ui_status_callback:
+                    ui_status_callback(progress_msg)
 
                 attempt = 1
                 step_ok = False

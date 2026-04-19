@@ -21,23 +21,63 @@ import json
 import re
 import sys
 
-class _DummyWriter:
-    def write(self, *args, **kwargs): pass
-    def flush(self): pass
-    def reconfigure(self, *args, **kwargs): pass
+import os
+from pathlib import Path
 
-try:
-    print("", end="")
-    _stdout_encoding = getattr(sys.stdout, 'encoding', None)
-    if _stdout_encoding and hasattr(sys.stdout, 'reconfigure') and _stdout_encoding.lower() != 'utf-8':
-        sys.stdout.reconfigure(encoding='utf-8')
-except Exception:
-    sys.stdout = _DummyWriter()
+def _get_user_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
 
-try:
-    print("", file=sys.stderr, end="")
-except Exception:
-    sys.stderr = _DummyWriter()
+DEBUG_LOG_FILE = _get_user_dir() / "JARVIS_DEBUG.log"
+
+class _FileDebugWriter:
+    def __init__(self, prefix=""):
+        self.prefix = prefix
+        self.buffer = ""
+        # Create file if missing
+        try:
+            with open(DEBUG_LOG_FILE, "a+", encoding="utf-8") as f:
+                f.write(f"\n--- MAIN MODULE BOOT: {self.prefix} ---\n")
+        except Exception:
+            pass
+
+    def write(self, s):
+        try:
+            if isinstance(s, bytes): s = s.decode("utf-8", "ignore")
+            self.buffer += s
+            if "\n" in self.buffer:
+                lines = self.buffer.split("\n")
+                self.buffer = lines.pop()
+                with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                    for line in lines:
+                        if line.strip(): f.write(f"{self.prefix} {line}\n")
+        except Exception:
+            pass
+
+    def flush(self):
+        pass
+
+    def reconfigure(self, *args, **kwargs):
+        pass
+
+# Force pipe everything to debug file if we are in .exe or can't reliably print
+if getattr(sys, "frozen", False):
+    sys.stdout = _FileDebugWriter("[STDOUT]")
+    sys.stderr = _FileDebugWriter("[STDERR]")
+else:
+    try:
+        print("", end="")
+        _stdout_encoding = getattr(sys.stdout, 'encoding', None)
+        if _stdout_encoding and hasattr(sys.stdout, 'reconfigure') and _stdout_encoding.lower() != 'utf-8':
+            sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        sys.stdout = _FileDebugWriter("[STDOUT]")
+    
+    try:
+        print("", file=sys.stderr, end="")
+    except Exception:
+        sys.stderr = _FileDebugWriter("[STDERR]")
 import traceback
 from pathlib import Path
 import urllib.request
@@ -53,6 +93,8 @@ def _patched_getproxies():
             p[k] = v.replace("socks://", "socks5h://")
     return p
 urllib.request.getproxies = _patched_getproxies
+
+from core.logger import logger
 
 import pyaudio
 from google import genai
@@ -79,10 +121,15 @@ from actions.code_helper      import code_helper
 from actions.dev_agent        import dev_agent
 from actions.web_search       import web_search as web_search_action
 from actions.computer_control import computer_control
+from actions.bluetooth_control import bluetooth_control
 
 
 class _SleepInterrupt(Exception):
     """Raised by _sleep_watcher to break the active session for sleep mode."""
+    pass
+
+class SessionRotationError(Exception):
+    """Raised when the conversation turn limit is reached to force a token-clearing reconnection."""
     pass
 
 
@@ -102,7 +149,10 @@ BASE_DIR        = Path(__file__).resolve().parent
 
 API_CONFIG_PATH = USER_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BUNDLE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# LIVE_MODEL is now dynamic. We keep a default and load from config if available.
+# LIVE_MODEL default
+from core.gemini_client import ModelRegistry, _mark_model_exhausted, get_api_key
+_DEFAULT_LIVE = "models/gemini-3.1-flash-live-preview"
 FORMAT              = pyaudio.paInt16
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
@@ -111,12 +161,6 @@ CHUNK_SIZE          = 1024
 
 pya = pyaudio.PyAudio()
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-    
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 def _load_system_prompt() -> str:
     try:
@@ -133,11 +177,69 @@ _memory_turn_lock     = threading.Lock()
 _MEMORY_EVERY_N_TURNS = 5
 _last_memory_input    = ""
 
+# ── Token Economy: Conversation buffer for cross-session context ──
+_conversation_buffer  = []          # list of {"user": ..., "jarvis": ...} dicts
+_MAX_CONV_BUFFER      = 5           # Keep only last 5 exchanges
+_last_session_summary = ""          # Compact summary injected on reconnect
+_conv_buffer_lock     = threading.Lock()
+
+
+def _append_conversation(user_text: str, jarvis_text: str) -> None:
+    """Thread-safe append to conversation buffer (ring buffer, max 5)."""
+    if not user_text and not jarvis_text:
+        return
+    with _conv_buffer_lock:
+        _conversation_buffer.append({
+            "user": (user_text or "")[:200],
+            "jarvis": (jarvis_text or "")[:200],
+        })
+        while len(_conversation_buffer) > _MAX_CONV_BUFFER:
+            _conversation_buffer.pop(0)
+
+
+def _summarize_conversation() -> str:
+    """
+    Generates a compact 2-3 sentence summary of recent conversation.
+    Called on session rotation to carry context across reconnections.
+    Uses gemini-3.1-flash-lite for minimal cost.
+    """
+    global _last_session_summary
+    with _conv_buffer_lock:
+        if not _conversation_buffer:
+            return _last_session_summary
+        exchanges = list(_conversation_buffer)
+
+    # Build a compact transcript
+    lines = []
+    for ex in exchanges:
+        if ex["user"]:
+            lines.append(f"User: {ex['user']}")
+        if ex["jarvis"]:
+            lines.append(f"Jarvis: {ex['jarvis']}")
+
+    transcript = "\n".join(lines)
+    if len(transcript) < 20:
+        return _last_session_summary
+
+    try:
+        from core.gemini_client import ask
+        summary = ask(
+            f"Summarize conversation in 1-2 VERY short sentences. "
+            f"Focus on the immediate context and pending tasks. "
+            f"Transcript:\n{transcript}"
+        )
+        _last_session_summary = summary.strip()[:300]
+        print(f"[TokenEconomy] 📝 Session summary: {_last_session_summary[:80]}...")
+    except Exception as e:
+        print(f"[TokenEconomy] ⚠️ Summary failed: {e}")
+
+    return _last_session_summary
+
 
 def _update_memory_async(user_text: str, jarvis_text: str) -> None:
     """
     Multilingual memory updater.
-    Model  : gemini-2.5-flash-lite (lowest cost)
+    Model  : gemini-3.1-flash-lite (lowest cost)
     Stage 1: Quick YES/NO check  → ~5 tokens output
     Stage 2: Full extraction     → only if Stage 1 says YES
     Result : ~80% fewer API calls vs original
@@ -164,8 +266,7 @@ def _update_memory_async(user_text: str, jarvis_text: str) -> None:
         check = ask(
             f"Does this message contain personal facts about the user "
             f"(name, age, city, job, hobby, relationship, birthday, preference)? "
-            f"Reply only YES or NO.\n\nMessage: {text[:300]}",
-            model="gemini-2.5-flash-lite"
+            f"Reply only YES or NO.\n\nMessage: {text[:300]}"
         )
         if "YES" not in check.upper():
             return
@@ -179,8 +280,7 @@ def _update_memory_async(user_text: str, jarvis_text: str) -> None:
             f'{{"identity":{{"name":{{"value":"..."}}}}}}, '
             f'"preferences":{{"hobby":{{"value":"..."}}}}, '
             f'"notes":{{"job":{{"value":"..."}}}}}}\n\n'
-            f"Message: {text[:500]}\n\nJSON:",
-            model="gemini-2.5-flash-lite"
+            f"Message: {text[:500]}\n\nJSON:"
         )
 
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
@@ -542,7 +642,35 @@ TOOL_DECLARATIONS = [
         },
         "required": ["origin", "destination", "date"]
     }
-}
+},
+{
+    "name": "bluetooth_control",
+        "description": (
+            "Controls Bluetooth devices, specifically room RGB lights and LEDs. "
+            "Use for: turning lights ON or OFF, changing colors (RGB), or controlling "
+            "any Bluetooth-enabled smart home devices. "
+            "Supports specific models like 'QHM-04D5' and generic Bluetooth LEDs. "
+            "If the user asks to turn off/on room lights or change room color, use this tool."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "on | off | rgb | toggle (default: toggle)"
+                },
+                "device": {
+                    "type": "STRING",
+                    "description": "Name or keyword for the device (e.g. 'QHM-04D5', 'Room Light', 'LED'). Default: 'Room Light'"
+                },
+                "value": {
+                    "type": "STRING",
+                    "description": "Color value for 'rgb' action (e.g. '#FF0000' or 'red', 'blue', etc.)"
+                }
+            },
+            "required": ["action"]
+        }
+    }
 ]
 
 class JarvisLive:
@@ -555,6 +683,7 @@ class JarvisLive:
         self._loop          = None
         self._is_executing_tool = False
         self._bg_tasks_active   = 0     # Track background agent_task count
+        self._interaction_count  = 0    # Token economy turn counter
 
     def speak(self, text: str):
         """Thread-safe bare-metal speak — forces AI to relay system notifications aloud."""
@@ -598,7 +727,16 @@ class JarvisLive:
             sys_prompt = time_ctx + mem_str + "\n\n" + sys_prompt
         else:
             sys_prompt = time_ctx + sys_prompt
-            
+
+        # ── Token Economy: Inject previous session summary for cross-session context ──
+        if _last_session_summary:
+            sys_prompt += (
+                f"\n\n[PREVIOUS SESSION CONTEXT]\n"
+                f"Here is a summary of the recent conversation before this session reconnected:\n"
+                f"{_last_session_summary}\n"
+                f"Use this context to maintain continuity. Do NOT mention session rotation to the user."
+            )
+
         sys_prompt += (
             f"\n\n[LANGUAGE DIRECTIVE — ABSOLUTE PRIORITY]"
             f"\nThe user has selected '{self.ui.spoken_language}' as the communication language."
@@ -756,11 +894,15 @@ class JarvisLive:
                     if self._bg_tasks_active == 0 and not self._is_executing_tool:
                         self.ui.status_text = "ONLINE"
 
+                def _ui_status_cb(msg):
+                    self.ui.status_text = msg
+
                 task_id = queue.submit(
                     goal=goal,
                     priority=priority,
                     speak=self.speak,
                     on_complete=_on_task_done,
+                    ui_status_callback=_ui_status_cb,
                 )
                 result = f"Task started (ID: {task_id}). I'll update you as I make progress, sir."
 
@@ -778,6 +920,12 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(
                     None, lambda: flight_finder(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
+            elif name == "bluetooth_control":
+                r = await loop.run_in_executor(
+                    None, lambda: bluetooth_control(parameters=args)
                 )
                 result = r or "Done."
 
@@ -804,7 +952,10 @@ class JarvisLive:
                 return
             try:
                 msg = await asyncio.wait_for(self.out_queue.get(), timeout=0.5)
-                await self.session.send_realtime_input(media=msg)
+                # Avoid deprecated media_chunks; use typed audio stream with explicit MIME type
+                await self.session.send_realtime_input(
+                    audio={'data': msg, 'mime_type': f'audio/pcm;rate={SEND_SAMPLE_RATE}'}
+                )
             except asyncio.TimeoutError:
                 continue
 
@@ -864,10 +1015,10 @@ class JarvisLive:
                 else:
                     silence_frames = 0
                     
-                # Explicit Noise Gate: Block stream routing on absolute silence (>0.9s trailing window)
-                # Radically prevents Gemini's internal buffer VAD algorithms from filling up with dead space
-                if silence_frames < 15:
-                    await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+                # Drop the explicit noise gate packet-drop. 
+                # Dropping packets causes Gemini server VAD starvation (it thinks network is lagging) -> extremely slow response times!
+                # We unconditionally send PCM (even if muted 0x00) so Gemini VAD can instantly detect silence and reply!
+                await self.out_queue.put(data)
 
         except Exception as e:
             print(f"[JARVIS] ❌ Mic error: {e}")
@@ -879,7 +1030,6 @@ class JarvisLive:
         print("[JARVIS] 👂 Recv started")
         out_buf = []
         in_buf  = []
-        _in_logged = False  # Track whether user speech was already logged
 
         try:
             while True:
@@ -899,24 +1049,22 @@ class JarvisLive:
                             txt = sc.input_transcription.text.strip()
                             if txt:
                                 in_buf.append(txt)
-                                # Log user speech IMMEDIATELY — don't wait for turn_complete
-                                if not _in_logged:
-                                    self.ui.write_log(f"You: {txt}")
-                                    self.ui.status_text = "PROCESSING"
-                                    _in_logged = True
+                                self.ui.status_text = "PROCESSING"
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = sc.output_transcription.text.strip()
                             if txt:
                                 out_buf.append(txt)
+                                self.ui.status_text = "RESPONDING"
 
                         if sc.turn_complete:
                             full_in  = " ".join(in_buf).strip() if in_buf else ""
                             full_out = ""
 
-                            # User speech was already logged immediately above — skip
+                            if full_in:
+                                self.ui.write_log(f"You: {full_in}")
+
                             in_buf = []
-                            _in_logged = False
 
                             if out_buf:
                                 full_out = " ".join(out_buf).strip()
@@ -924,12 +1072,35 @@ class JarvisLive:
                                     self.ui.write_log(f"Jarvis: {full_out}")
                             out_buf = []
 
+                            # Token Economy: Track conversation for cross-session context
+                            if full_in or full_out:
+                                _append_conversation(full_in, full_out)
+
                             if full_in and len(full_in) > 5:
                                 threading.Thread(
                                     target=_update_memory_async,
                                     args=(full_in, full_out),
                                     daemon=True
                                 ).start()
+
+                            # Turn is over — return to ONLINE state or PROCESSING if working
+                            # FIX: Don't overwrite granular status (e.g. "Step 1/3") with generic "PROCESSING"
+                            if not self._is_executing_tool and self._bg_tasks_active == 0:
+                                self.ui.status_text = "ONLINE"
+                            elif self._bg_tasks_active > 0 or self._is_executing_tool:
+                                if self.ui.status_text in ("ONLINE", "RESPONDING", "CONNECTING", "SPEAKING"):
+                                    self.ui.status_text = "PROCESSING"
+                            self._interaction_count += 1
+                            if self._interaction_count >= 10:
+                                self._interaction_count = 0
+                                # Summarize before disconnecting so next session has context
+                                threading.Thread(
+                                    target=_summarize_conversation,
+                                    daemon=True
+                                ).start()
+                                # Small delay to allow last audio chunk to hit the card buffers
+                                await asyncio.sleep(0.3)
+                                raise SessionRotationError("Token Limit Rotation")
 
                     if response.tool_call:
                         fn_responses = []
@@ -972,6 +1143,8 @@ class JarvisLive:
                             self.ui.jarvis_level = 0.0
                             if not self._is_executing_tool and self._bg_tasks_active == 0:
                                 self.ui.status_text = "ONLINE"
+                            elif self._bg_tasks_active > 0 or self._is_executing_tool:
+                                self.ui.status_text = "PROCESSING"
                     continue
                 
                 if self.ui:
@@ -999,12 +1172,14 @@ class JarvisLive:
         finally:
             stream.close()
 
-    async def run(self):
-        client = genai.Client(
-            api_key=_get_api_key(),
-            http_options={"api_version": "v1beta"}
-        )
+    async def _check_restart(self):
+        while True:
+            if getattr(self.ui, "needs_restart", False):
+                self.ui.needs_restart = False
+                raise SessionRotationError("Config changed")
+            await asyncio.sleep(0.5)
 
+    async def run(self):
         backoff = 3
         max_backoff = 60
         consecutive_failures = 0
@@ -1021,65 +1196,93 @@ class JarvisLive:
                 self._start_wake_listener()
                 # Block in a thread-safe way (doesn't depend on asyncio loop health)
                 await asyncio.to_thread(self._woken.wait)
-                print("[JARVIS] ☀️ Wake signal received — reconnecting...")
+                print("[JARVIS] ☀️ Wake signal received — unblocking main engine...")
+                # Ensure state is updated before continuing
+                await asyncio.sleep(0.5) 
                 continue
 
             try:
+                # 1. Initialize fresh GenAI client
+                api_key = get_api_key()
+                client = genai.Client(api_key=api_key)
+                
                 self.ui.conn_state = "CONNECTING"
                 self.ui.status_text = "CONNECTING"
-                print("[JARVIS] 🔌 Connecting...")
+                
+                # 2. Get prioritized model chain
+                models_to_try = ModelRegistry.get_voice_chain(_DEFAULT_LIVE)
                 config = self._build_config()
-
-                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-                    self.session        = session
-                    self._loop          = asyncio.get_event_loop() 
-                    self.audio_in_queue = asyncio.Queue()
-                    self.out_queue      = asyncio.Queue(maxsize=10)
-
-                    # Connection successful — reset backoff
-                    backoff = 3
-                    consecutive_failures = 0
-                    self.ui.conn_state = "ONLINE"
-                    self.ui.status_text = "ONLINE"
-                    print("[JARVIS] ✅ Connected.")
-                    self.ui.write_log("SYS: JARVIS online.")
-
-                    # Tasks check ui.is_sleeping and return gracefully.
-                    # _receive_audio may block on async-for, so we use
-                    # FIRST_COMPLETED to detect when a sleep-aware task exits,
-                    # then cancel the stuck one.
-                    tasks = [
-                        asyncio.create_task(self._send_realtime()),
-                        asyncio.create_task(self._listen_audio()),
-                        asyncio.create_task(self._receive_audio()),
-                        asyncio.create_task(self._play_audio()),
-                    ]
-                    done, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    # Cancel remaining tasks with a short timeout
-                    for t in pending:
-                        t.cancel()
+                
+                for idx, m in enumerate(models_to_try):
                     try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*pending, return_exceptions=True),
-                            timeout=2.0
-                        )
-                    except asyncio.TimeoutError:
-                        print("[JARVIS] ⚠️ Force-cancelled stuck tasks")
-                    # Re-raise if any finished task had a real error
-                    for t in done:
-                        try:
-                            exc = t.exception()
-                        except asyncio.CancelledError:
-                            exc = None
-                        if exc:
-                            raise exc
+                        logger.log("LIVE", f"Connecting to {m}...", level="LIVE")
+                        
+                        # Fix: Ensure we use the correct async context manager syntax for the SDK
+                        async with client.aio.live.connect(model=m, config=config) as session:
+                            self.session        = session
+                            self._loop          = asyncio.get_event_loop() 
+                            self.audio_in_queue = asyncio.Queue()
+                            self.out_queue      = asyncio.Queue(maxsize=10)
+
+                            # Connection successful — reset backoff
+                            backoff = 3
+                            consecutive_failures = 0
+                            logger.state(f"Connected to {m}.", icon="✅")
+                            self.ui.conn_state = "ONLINE"
+                            self.ui.status_text = "ONLINE"
+                            self.ui.write_log(f"SYS: JARVIS online ({m}).")
+
+                            # Running tasks — if sleep/Error occurs, this exits the 'async with'
+                            tasks = [
+                                asyncio.create_task(self._send_realtime()),
+                                asyncio.create_task(self._listen_audio()),
+                                asyncio.create_task(self._receive_audio()),
+                                asyncio.create_task(self._play_audio()),
+                                asyncio.create_task(self._check_restart()),
+                            ]
+                            done, pending = await asyncio.wait(
+                                tasks, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            # Cancel remaining tasks
+                            for t in pending: t.cancel()
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.gather(*pending, return_exceptions=True),
+                                    timeout=2.0
+                                )
+                            except asyncio.TimeoutError:
+                                print("[JARVIS] ⚠️ Force-cancelled stuck tasks")
+                            
+                            # Re-raise if any finished task had a real error
+                            for t in done:
+                                try:
+                                    exc = t.exception()
+                                except asyncio.CancelledError:
+                                    exc = None
+                                if exc: raise exc
+                            
+                            # If we get here, tasks finished normally (e.g. is_sleeping)
+                            break # Success — exit the model rotation loop
+
+                    except Exception as e:
+                        err_msg = str(e).lower()
+                        if "429" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
+                            _mark_model_exhausted(m)
+                            self.ui.write_log(f"SYS: {m} exhausted. Rotating...")
+                            if idx < len(models_to_try) - 1:
+                                continue # Try next model
+                        raise # Permanent failure or other error
 
                 # If we exited the session because of sleep, skip error handling
                 if self.ui.is_sleeping:
                     print("[JARVIS] 😴 Session disconnected for sleep.")
                     continue
+
+            except SessionRotationError:
+                print("[JARVIS] ♻️ Token economy: Rotating Live API session to clear memory overhead...")
+                consecutive_failures = 0
+                backoff = 3
+                continue
 
             except Exception as e:
                 consecutive_failures += 1
@@ -1152,32 +1355,51 @@ class JarvisLive:
             def __exit__(self, *args):
                 self.stream = None
 
+        # Balanced sensitivity: 500 is reliable for most laptop/desktop mics.
+        # Dynamic threshold re-enabled with constraints to adapt to environment.
         recognizer = sr.Recognizer()
-        recognizer.energy_threshold = 800
+        recognizer.energy_threshold = 500
         recognizer.dynamic_energy_threshold = True
-        recognizer.dynamic_energy_adjustment_damping = 0.15
-        recognizer.dynamic_energy_ratio = 1.6
-        recognizer.pause_threshold = 1.0
+        recognizer.dynamic_energy_adjustment_ratio = 1.5
+        recognizer.pause_threshold = 0.8
 
         mic_desktop = sr.Microphone()
+        
+        # Calibrate once at startup for ambient noise baseline
+        try:
+            with mic_desktop as source:
+                recognizer.adjust_for_ambient_noise(source, duration=1.0)
+                print(f"[WAKE] 🔧 Calibrated energy threshold: {recognizer.energy_threshold:.0f}")
+        except Exception as e:
+            print(f"[WAKE] ⚠️ Calibration error: {e}")
 
         print("[WAKE] 🎤 Wake listener active — say 'wake up' to resume...")
 
+        _heartbeat_counter = 0
+
         while self.ui.is_sleeping:
+            # ── Mobile connected → skip STT, wake button handles it via WebSocket ──
+            if getattr(self.ui, 'mobile_connected', False):
+                _heartbeat_counter += 1
+                if _heartbeat_counter % 12 == 0:
+                    print("[WAKE] 📱 Mobile connected — waiting for wake button press...")
+                time.sleep(0.5)
+                continue
+
+            # ── No mobile → use laptop mic + speech recognition ──
             try:
-                # Seamlessly hot-swap the hardware layer based on connection context
-                active_source = MobileAudioSource(self.ui.mobile_mic_queue) if getattr(self.ui, 'mobile_connected', False) else mic_desktop
-                
-                with active_source as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                    audio = recognizer.listen(source, timeout=3, phrase_time_limit=4)
+                with mic_desktop as source:
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
 
                 # Try recognition
                 text = None
                 try:
                     text = recognizer.recognize_google(audio, language="en-US").lower().strip()
                 except sr.UnknownValueError:
-                    print("[WAKE] 🔇 Heard speech but couldn't understand — keep listening")
+                    # Don't spam logs — only log occasionally
+                    _heartbeat_counter += 1
+                    if _heartbeat_counter % 6 == 0:
+                        print(f"[WAKE] 💓 Still listening... (threshold: {recognizer.energy_threshold:.0f})")
                     continue
                 except sr.RequestError as e:
                     print(f"[WAKE] ⚠️ Google API error: {e} — retrying...")
@@ -1187,15 +1409,26 @@ class JarvisLive:
                 if text:
                     print(f"[WAKE] 👂 Heard: '{text}'")
 
-                    # Check for wake phrase (flexible matching)
-                    wake_words = ["wake up", "wake", "wakeup", "hey jarvis", "jarvis"]
-                    if any(w in text for w in wake_words):
+                    # Flexible wake phrase matching (exact, partial, and fuzzy)
+                    wake_exact = ["wake up", "wake", "wakeup", "hey jarvis", "jarvis",
+                                  "wake up jarvis", "jarvis wake up", "hey wake up"]
+                    # Direct match
+                    if any(w in text for w in wake_exact):
                         print("[WAKE] ✅ Wake word detected!")
+                        self.ui.wake_up()
+                        return
+                    # Fuzzy partial match (handles "wait up", "make up" misrecognitions)
+                    fuzzy_parts = ["wake", "jarv", "woke"]
+                    if any(p in text for p in fuzzy_parts):
+                        print(f"[WAKE] ✅ Fuzzy wake match: '{text}'")
                         self.ui.wake_up()
                         return
 
             except sr.WaitTimeoutError:
-                # No speech for 8s — totally normal during sleep, keep listening
+                # No speech detected — normal during sleep
+                _heartbeat_counter += 1
+                if _heartbeat_counter % 6 == 0:
+                    print(f"[WAKE] 💓 Still listening... (threshold: {recognizer.energy_threshold:.0f})")
                 continue
             except Exception as e:
                 print(f"[WAKE] ⚠️ Listener error: {e}")
@@ -1210,11 +1443,19 @@ def main():
     def runner():
         ui.wait_for_api_key()
         
+        # Initial scan models on startup
+        from core.gemini_client import ModelRegistry
+        logger.log("SYS", "Initial boot: Force-scanning available models...", level="SYS")
+        ui.write_log("SYS: Scanning available models via API...")
+        ModelRegistry.scan_models()
+        ModelRegistry.auto_align_roles()
+        
         jarvis = JarvisLive(ui)
         try:
+            logger.state("Handshake confirmed. Starting JARVIS engine...", icon="⚡")
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
-            print("\n🔴 Shutting down...")
+            logger.state("Shutting down...", icon="🔴")
 
     threading.Thread(target=runner, daemon=True).start()
     ui.mainloop()

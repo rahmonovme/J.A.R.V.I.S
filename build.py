@@ -29,6 +29,7 @@ def build():
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--name", "JARVIS",
+        "--icon", f"static{os.sep}icon.ico",
         "--noconsole",                        # No terminal window
         "--add-data", f"static{os.sep}*{os.pathsep}static",   # Bundle web UI
         "--add-data", f"core{os.sep}*{os.pathsep}core",        # Bundle prompts

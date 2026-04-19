@@ -1,13 +1,3 @@
-# actions/computer_settings.py
-# MARK XXV — Computer Settings & UI Controls
-#
-# Kullanıcı "sesi aç", "uygulamayı kapat", "tam ekran yap", "şunu yaz" gibi
-# bilgisayar kontrol komutları verdiğinde bu dosya devreye girer.
-#
-# - Intent detection: Gemini ile (multi-language, hardcoded keyword yok)
-# - Cross-platform: Windows / macOS / Linux
-# - pyautogui + platform-specific API'ler
-
 import time
 import subprocess
 import sys
@@ -28,6 +18,18 @@ try:
 except ImportError:
     _PYPERCLIP = False
 
+if platform.system() == "Windows":
+    try:
+        import win32gui
+        import win32con
+        import win32api
+        import ctypes
+        _WIN32 = True
+    except ImportError:
+        _WIN32 = False
+else:
+    _WIN32 = False
+
 _OS = platform.system() 
 
 def get_base_dir() -> Path:
@@ -43,6 +45,62 @@ def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
+
+# ── Native Window Management (Windows Only) ──
+
+def find_window_by_name(name: str) -> int:
+    """Finds the most likely HWND for a given application or window title."""
+    if not _WIN32: return 0
+    hwnds = []
+    def enum_cb(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            text = win32gui.GetWindowText(hwnd).lower()
+            if name.lower() in text:
+                hwnds.append(hwnd)
+    win32gui.EnumWindows(enum_cb, None)
+    return hwnds[0] if hwnds else 0
+
+def move_window_native(name: str, monitor_index: int = 0):
+    """Moves a window to a specific monitor using native Win32 API."""
+    if not _WIN32: return
+    hwnd = find_window_by_name(name)
+    if not hwnd:
+        # Try foreground window as fallback
+        hwnd = win32gui.GetForegroundWindow()
+    
+    monitors = win32api.EnumDisplayMonitors()
+    if monitor_index >= len(monitors):
+        monitor_index = 0
+    
+    target_mon = monitors[monitor_index]
+    rect = target_mon[2] # (left, top, right, bottom)
+    
+    # Get current window size
+    wr = win32gui.GetWindowRect(hwnd)
+    w, h = wr[2] - wr[0], wr[3] - wr[1]
+    
+    # Move and keep size
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE) # Ensure not minimized
+    win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, rect[0], rect[1], w, h, win32con.SWP_SHOWWINDOW)
+    print(f"[Settings] 🖥️ Moved {name} to Monitor {monitor_index} at ({rect[0]}, {rect[1]})")
+
+def resize_window_native(name: str, w: int, h: int):
+    """Resizes a window natively."""
+    if not _WIN32: return
+    hwnd = find_window_by_name(name) or win32gui.GetForegroundWindow()
+    wr = win32gui.GetWindowRect(hwnd)
+    win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, wr[0], wr[1], w, h, win32con.SWP_SHOWWINDOW)
+
+def set_window_state_native(name: str, state: str):
+    """Minimizes, Maximizes or sets Fullscreen via native API."""
+    if not _WIN32: return
+    hwnd = find_window_by_name(name) or win32gui.GetForegroundWindow()
+    if state == "minimize":
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+    elif state == "maximize":
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+    elif state == "restore":
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
 def volume_up():
     if _OS == "Windows":
@@ -109,7 +167,39 @@ def close_app():
     if _OS == "Darwin":
         pyautogui.hotkey("command", "q")
     else:
+        if _OS == "Windows":
+            import ctypes
+            try:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.upper()
+                if "J.A.R.V.I.S" in title or "MAIN.PY" in title or "MAIN.EXE" in title:
+                    pyautogui.hotkey("alt", "esc")
+                    time.sleep(0.3)
+            except Exception:
+                pass
         pyautogui.hotkey("alt", "f4")
+
+def close_all_apps():
+    """Politely closes all open application windows except JARVIS and Windows shell."""
+    if _OS == "Windows":
+        # Only exclude JARVIS's own processes and the Windows shell
+        script = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        ps_cmd = (
+            "Get-Process | Where-Object { "
+            "$_.MainWindowHandle -ne 0 "
+            "-and $_.ProcessName -notmatch '(?i)^(python|pythonw|jarvis|main|explorer|conhost|powershell|cmd|WindowsTerminal)$' "
+            "} | ForEach-Object { $_.CloseMainWindow() }"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, creationflags=script
+        )
+    elif _OS == "Darwin":
+        script = 'tell application "System Events" to tell (every process whose background only is false and name is not "Finder" and name is not "Terminal" and name is not "Python") to quit'
+        subprocess.run(["osascript", "-e", script])
 
 def close_window():
     if _OS == "Darwin":
@@ -141,6 +231,12 @@ def snap_left():
 
 def snap_right():
     if _OS == "Windows": pyautogui.hotkey("win", "right")
+
+def move_monitor_left():
+    if _OS == "Windows": pyautogui.hotkey("win", "shift", "left")
+
+def move_monitor_right():
+    if _OS == "Windows": pyautogui.hotkey("win", "shift", "right")
 
 def switch_window():
     if _OS == "Darwin":
@@ -407,6 +503,10 @@ ACTION_MAP = {
     "stop_video":              pause_video,
     "resume_video":            pause_video,
     "close_app":               close_app,
+    "close_all_apps":          close_all_apps,
+    "close_all":               close_all_apps,
+    "close_all_windows":       close_all_apps,
+    "close_everything":        close_all_apps,
     "close_window":            close_window,
     "quit_app":                close_app,
     "exit_app":                close_app,
@@ -423,6 +523,12 @@ ACTION_MAP = {
     "snap_right":              snap_right,
     "window_left":             snap_left,
     "window_right":            snap_right,
+    "move_window_left":        move_monitor_left,
+    "move_window_right":       move_monitor_right,
+    "move_monitor_left":       move_monitor_left,
+    "move_monitor_right":      move_monitor_right,
+    "resize_window":           "resize_window",
+    "move_window":             "move_window",
     "switch_window":           switch_window,
     "alt_tab":                 switch_window,
     "next_window":             switch_window,
@@ -464,6 +570,10 @@ ACTION_MAP = {
     "focus_search":            focus_search,
     "address_bar":             focus_search,
     "url_bar":                 focus_search,
+    "close_app":               close_app,
+    "close":                   close_app,
+    "quit_app":                close_app,
+    "exit_app":                close_app,
     "refresh_page":            refresh_page,
     "reload_page":             refresh_page,
     "reload":                  refresh_page,
@@ -504,7 +614,10 @@ ACTION_MAP = {
     "press_enter":             press_enter,
     "escape":                  press_escape,
     "press_escape":            press_escape,
-    "cancel":                  press_escape,
+    "close_app":               close_app,
+    "close":                   close_app,
+    "close_window":            close_app,
+    "quit_app":                close_app,
     "close_jarvis":            quit_jarvis,
     "quit_jarvis":             quit_jarvis,
     "exit_jarvis":             quit_jarvis,
@@ -556,6 +669,11 @@ Examples:
 - "küçült" → {{"action": "minimize", "value": null}}
 - "minimize the window" → {{"action": "minimize", "value": null}}
 - "büyüt" → {{"action": "maximize", "value": null}}
+- "tam ekran yap" → {{"action": "full_screen", "value": null}}
+- "chap ekranga o'tkaz" → {{"action": "move_monitor_left", "value": null}}
+- "o'ng ekranga o'tkaz" → {{"action": "move_monitor_right", "value": null}}
+- "move to left monitor" → {{"action": "move_monitor_left", "value": null}}
+- "move to right monitor" → {{"action": "move_monitor_right", "value": null}}
 - "parlaklığı artır" → {{"action": "brightness_up", "value": null}}
 - "parlaklığı azalt" → {{"action": "brightness_down", "value": null}}
 - "increase brightness" → {{"action": "brightness_up", "value": null}}
@@ -582,8 +700,9 @@ Examples:
 - "escape'e bas" → {{"action": "escape", "value": null}}
 - "close yourself" → {{"action": "close_jarvis", "value": null}}
 - "close jarvis" → {{"action": "close_jarvis", "value": null}}
-- "close the app" → {{"action": "close_app", "value": null}}
-- "close" → {{"action": "close_app", "value": null}} (NEVER map 'close' to shutdown/restart/lock)
+- "close" → {{"action": "close_app", "value": null}}
+- "close_app" → {{"action": "close_app", "value": null}}
+- "uygulamani yop" → {{"action": "close_app", "value": null}}
 - "yes" → {{"action": "confirm", "value": null}}
 - "confirm" → {{"action": "confirm", "value": null}}
 - "no" → {{"action": "cancel", "value": null}}
@@ -596,7 +715,7 @@ IMPORTANT:
 - Return ONLY the JSON object, no explanation, no markdown."""
 
     try:
-        text = ask(prompt, model="gemini-2.5-flash-lite")
+        text = ask(prompt)
         text = __import__("re").sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         return json.loads(text)
     except Exception as e:
@@ -625,7 +744,7 @@ def computer_settings(
     description = params.get("description", "").strip()
     value       = params.get("value", None)
 
-    if not raw_action and description:
+    if (not raw_action or raw_action.lower() == "description") and description:
         detected   = _detect_action(description)
         raw_action = detected.get("action", "")
         if value is None:
@@ -638,6 +757,45 @@ def computer_settings(
 
     print(f"[Settings] ⚙️ Action: {action}  Value: {value}")
 
+    # --- Native Window Special Handlers ---
+    if _WIN32:
+        if action in ("move_window_left", "move_monitor_left"):
+            app_name = params.get("app_name") or params.get("window_name") or ""
+            move_window_native(app_name, 0)
+            return f"Moved {app_name or 'window'} to first monitor."
+        
+        if action in ("move_window_right", "move_monitor_right"):
+            app_name = params.get("app_name") or params.get("window_name") or ""
+            move_window_native(app_name, 1)
+            return f"Moved {app_name or 'window'} to second monitor."
+
+        if action == "resize_window":
+            app_name = params.get("app_name") or ""
+            try:
+                # Value could be "1280x720" or similar
+                if isinstance(value, str) and "x" in value:
+                    w, h = map(int, value.split("x"))
+                else:
+                    w, h = 1280, 720
+                resize_window_native(app_name, w, h)
+                return f"Resized {app_name or 'window'} to {w}x{h}."
+            except Exception as e:
+                return f"Resize failed: {e}"
+
+        if action == "minimize":
+            app_name = params.get("app_name") or ""
+            set_window_state_native(app_name, "minimize")
+            return f"Minimized {app_name or 'window'}."
+
+        if action == "maximize":
+            app_name = params.get("app_name") or ""
+            set_window_state_native(app_name, "maximize")
+            return f"Maximized {app_name or 'window'}."
+
+        if action == "fullscreen":
+            app_name = params.get("app_name") or ""
+            set_window_state_native(app_name, "maximize") # Simple fallback
+            return f"Set {app_name or 'window'} to fullscreen."
 
     if action == "volume_set":
         try:

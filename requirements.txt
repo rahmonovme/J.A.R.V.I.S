@@ -25,3 +25,5 @@ SpeechRecognition
 cryptography
 pyinstaller
 ddgs
+bleak
+pywin32; sys_platform == "win32"

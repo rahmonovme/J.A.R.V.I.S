@@ -31,6 +31,7 @@ class Task:
     error:       str        = field(compare=False, default="")
     speak:       Any        = field(compare=False, default=None)   
     on_complete: Any        = field(compare=False, default=None)  
+    ui_status_callback: Any = field(compare=False, default=None)
     cancel_flag: threading.Event = field(compare=False, default_factory=threading.Event)
 
 
@@ -76,6 +77,7 @@ class TaskQueue:
         priority:    TaskPriority = TaskPriority.NORMAL,
         speak:       Callable | None = None,
         on_complete: Callable | None = None,
+        ui_status_callback: Callable | None = None,
     ) -> str:
 
         task_id = str(uuid.uuid4())[:8]
@@ -86,6 +88,7 @@ class TaskQueue:
             goal        = goal,
             speak       = speak,
             on_complete = on_complete,
+            ui_status_callback = ui_status_callback,
         )
 
         with self._condition:
@@ -176,9 +179,10 @@ class TaskQueue:
         try:
             executor = self._get_executor()
             result   = executor.execute(
-                goal        = task.goal,
-                speak       = task.speak,
-                cancel_flag = task.cancel_flag,
+                goal               = task.goal,
+                speak              = task.speak,
+                cancel_flag        = task.cancel_flag,
+                ui_status_callback = task.ui_status_callback,
             )
 
             with self._lock:

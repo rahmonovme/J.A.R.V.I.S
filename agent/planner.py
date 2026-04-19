@@ -140,6 +140,11 @@ dev_agent
   description: string (required)
   language: string (optional)
 
+bluetooth_control
+  action: "power_on" | "power_off" | "set_color" | "set_brightness" (required)
+  value: string (for set_color: "#RRGGBB" hex; for set_brightness: "0-100")
+  device: string (optional) — If omitted, AI will autodiscover the most likely LED strip in the room.
+
 EXAMPLES:
 
 Goal: "makine mühendisliği hakkında araştırma yap ve not defterine kaydet"
@@ -282,8 +287,7 @@ def create_plan(goal: str, context: str = "") -> dict:
         user_input += f"\n\nContext: {context}"
 
     try:
-        text = ask(user_input, model="gemini-2.5-flash-lite",
-                   system_instruction=PLANNER_PROMPT)
+        text = ask(user_input, system_instruction=PLANNER_PROMPT)
         text     = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
 
         plan = json.loads(text)
@@ -359,8 +363,7 @@ Error: {error}
 Create a REVISED plan for the remaining work only. Do not repeat completed steps."""
 
     try:
-        text = ask(prompt, model="gemini-2.5-flash",
-                   system_instruction=PLANNER_PROMPT)
+        text = ask(prompt, system_instruction=PLANNER_PROMPT)
         text     = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         plan     = json.loads(text)
 

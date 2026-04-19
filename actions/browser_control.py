@@ -183,6 +183,10 @@ class _BrowserThread:
         return self._page
 
     async def _launch(self):
+        # Lazy re-init if playwright was stopped
+        if self._playwright is None:
+            await self._init()
+
         prog_id                        = _get_default_browser_id()
         engine_name, exe_path, channel = _find_browser_executable(prog_id)
         engine                         = getattr(self._playwright, engine_name)
@@ -207,6 +211,8 @@ class _BrowserThread:
                 )
         except Exception as e:
             print(f"[Browser] ⚠️ Launch failed ({e}), falling back to built-in Chromium")
+            if self._playwright is None:
+                 await self._init()
             self._browser = await self._playwright.chromium.launch(
                 headless=False,
                 args=["--start-maximized"]
@@ -395,21 +401,10 @@ class _BrowserThread:
                     )
                     if proc_name.lower() in result.stdout.lower():
                         subprocess.run(
-                            ["powershell", "-Command",
-                             f"(Get-Process -Name '{proc_name.replace('.exe', '')}' "
-                             f"-ErrorAction SilentlyContinue | "
-                             f"Select-Object -First 1).CloseMainWindow()"],
-                            capture_output=True, timeout=5
+                            ["taskkill", "/IM", proc_name, "/F"],
+                            capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW
                         )
                         closed.append(display_name)
-                except Exception:
-                    pass
-
-            if not closed:
-                try:
-                    pyautogui.hotkey("alt", "F4")
-                    time.sleep(0.5)
-                    return "Browser closed (Alt+F4)."
                 except Exception:
                     pass
 

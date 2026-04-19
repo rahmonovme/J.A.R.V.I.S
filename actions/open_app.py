@@ -207,6 +207,15 @@ def _launch_via_search_with_verify(app_name: str) -> bool:
         print(f"[open_app] ⚠️ No matching process after search — "
               f"app may not be installed")
         try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value.upper()
+            if "J.A.R.V.I.S" in title or "MAIN.PY" in title or "MAIN.EXE" in title:
+                pyautogui.hotkey("alt", "esc")
+                time.sleep(0.3)
             pyautogui.hotkey("alt", "f4")  # Close the wrong window
             time.sleep(0.5)
         except Exception:

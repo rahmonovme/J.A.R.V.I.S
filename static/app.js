@@ -34,6 +34,9 @@ const S = {
   speaking: false, micLevel: 0, jarvisLevel: 0,
   connState: "CONNECTING", statusText: "INITIALISING",
   tick: 0, t0: Date.now(),
+  // Models
+  models: { roles: {}, chains: {}, custom_limits: {}, inventory: [] },
+  activeTab: "tab-general",
   // Orb
   orbPulse: 0, orbTarget: 0, orbLastT: 0,
   orbRings: [0, 120, 240],
@@ -69,6 +72,7 @@ window._onState = function(d) {
   S.jarvisLevel = d.jarvis_level || 0;
   S.connState   = d.conn_state || "ONLINE";
   S.statusText  = d.status_text || "ONLINE";
+  S.isSleeping  = d.status_text === "SLEEPING";
 
   if (d.is_building) {
     const cls1 = document.getElementById("modal-close-settings");
@@ -96,6 +100,22 @@ window._onState = function(d) {
     const overlay = document.getElementById("mobile-overlay");
     if (overlay) overlay.remove();
   }
+
+  // Mobile: toggle sleep button → wake button when sleeping
+  if (isMobile) {
+    const btn = $("btn-sleep");
+    if (btn) {
+      if (S.isSleeping) {
+        btn.classList.add("wake-mode");
+        btn.title = "Wake Up";
+        btn.innerHTML = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>';
+      } else {
+        btn.classList.remove("wake-mode");
+        btn.title = "Sleep Mode";
+        btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>';
+      }
+    }
+  }
 };
 const seenLogs = new Set();
 window._onLog = function(text, tag, id) {
@@ -104,12 +124,6 @@ window._onLog = function(text, tag, id) {
     seenLogs.add(id);
   }
   addLog(text, tag || "sys");
-};
-window._onSetupRequired = function() { $("setup-screen").style.display = "flex"; };
-window._onSetupOk = function() {
-  const el = $("setup-screen");
-  el.style.opacity = "0"; el.style.transition = "opacity 0.5s";
-  setTimeout(() => el.style.display = "none", 500);
 };
 
 /* ═══════ DYNAMIC OS LABELING ═══════ */
@@ -572,7 +586,12 @@ function wsConnect() {
     if (btnSettings) btnSettings.style.display = "none";
   }
   try { ws = new WebSocket(`${proto}://${location.host}/ws?device=${device}`); } catch { wsRetry(); return; }
-  ws.onopen = () => {};
+  ws.onopen = () => {
+    // Proactively check setup status on connect to avoid missing the initial push
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "check_setup" }));
+    }
+  };
   ws.onmessage = async (e) => {
     if (e.data instanceof window.Blob) {
       if (isMobile) {
@@ -586,7 +605,7 @@ function wsConnect() {
       if (d.type === "state") window._onState(d);
       else if (d.type === "log") window._onLog(d.text, d.tag, d.id);
       else if (d.type === "settings") applySettings(d);
-      else if (d.type === "setup_required") window._onSetupRequired();
+      else if (d.type === "setup_required") window._onSetupRequired(d);
       else if (d.type === "setup_ok") window._onSetupOk();
       else if (d.type === "save_result") {
         const st = $("key-status");
@@ -594,6 +613,16 @@ function wsConnect() {
         st.className = "status-msg " + (d.success ? "ok" : "err");
       }
       else if (d.type === "autostart_result") setAutoBtn(d.enabled);
+      else if (d.type === "model_inventory") { S.models = d; renderModelList(); }
+      else if (d.type === "scan_result") {
+        $("btn-scan-models").innerText = d.success ? "✓ SYNCED" : "FAILED";
+        setTimeout(() => $("btn-scan-models").innerText = "SYNC MODELS", 2000);
+        if(d.success) callApi("get_model_inventory");
+      }
+      else if (d.type === "save_config_result") {
+        const btn = $("btn-scan-models");
+        if(d.success) { btn.innerText = "SAVED!"; setTimeout(()=>btn.innerText="SYNC MODELS", 2000); }
+      }
     } catch {}
   };
   ws.onclose = () => wsRetry();
@@ -621,15 +650,28 @@ function drainLog() {
 const overlay = $("modal-settings");
 let apiVis = false;
 async function callApi(method,...args) {
-  if(window.pywebview && window.pywebview.api) {
-    try { return await window.pywebview.api[method](...args); } catch {}
+  // Try pywebview native bridge first (desktop .exe mode)
+  if(window.pywebview && window.pywebview.api && window.pywebview.api[method]) {
+    try {
+      const result = await window.pywebview.api[method](...args);
+      return result;
+    } catch(e) {
+      console.error('[API] pywebview call failed:', method, e);
+      // Fall through to WS fallback
+    }
   }
+  // WS fallback (browser mode, mobile, or pywebview failure)
   if(method==="get_settings"){wsSend({type:"get_settings"});return null;}
   if(method==="save_api_key"){wsSend({type:"save_api_key",key:args[0]});return null;}
   if(method==="setup_api_key"){wsSend({type:"setup_api_key",key:args[0]});return null;}
   if(method==="start_session"){wsSend({type:"start_session",payload:args[0]});return null;}
   if(method==="toggle_autostart"){wsSend({type:"toggle_autostart"});return null;}
   if(method==="sleep_mode"){wsSend({type:"sleep_mode"});return null;}
+  if(method==="wake_up"){wsSend({type:"wake_up"});return null;}
+  if(method==="get_model_inventory"){wsSend({type:"get_model_inventory"});return null;}
+  if(method==="scan_models"){wsSend({type:"scan_models"});return null;}
+  if(method==="save_model_config"){wsSend({type:"save_model_config",data:args[0]});return null;}
+  if(method==="clear_language"){wsSend({type:"clear_language"});return null;}
   return null;
 }
 $("btn-settings").onclick = async()=>{overlay.classList.add("active");const r=await callApi("get_settings");if(r)applySettings(r);};
@@ -642,6 +684,104 @@ $("btn-toggle-vis").onclick=()=>{
   $("eye-icon").innerHTML=apiVis
     ?'<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/>'
     :'<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
+};
+
+/* ── Tab Switching ── */
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll(".tab-btn, .tab-content").forEach(el => el.classList.remove("active"));
+    btn.classList.add("active");
+    const tabId = btn.getAttribute("data-tab");
+    $(tabId).classList.add("active");
+    S.activeTab = tabId;
+    if (tabId === "tab-models") refreshModels();
+  };
+});
+
+async function refreshModels() {
+  // Safe inventory check
+  const m = S.models || {};
+  const inv = m.inventory || [];
+  if (inv.length === 0) renderModelList(); 
+  
+  let r = await callApi("get_model_inventory");
+  if (r) {
+    if (typeof r === 'string') {
+      try { r = JSON.parse(r); } catch(e) {}
+    }
+    S.models = r;
+    renderModelList();
+  }
+}
+
+$("btn-scan-models").onclick = async () => {
+  $("btn-scan-models").innerText = "SCANNING...";
+  await callApi("scan_models");
+};
+
+function renderModelList() {
+  const container = $("model-list-container");
+  if (!container) return;
+  
+  const m = S.models || {};
+  const inv = m.inventory || [];
+  
+  if (inv.length === 0) {
+    container.innerHTML = `
+      <div style="text-align:center;padding:40px 20px;opacity:0.6;">
+        <div class="loader-ring" style="margin:0 auto 15px;"></div>
+        <p style="font-family:var(--font-mono);font-size:11px;">Scanning available engines...</p>
+        <button class="btn btn-sm" onclick="callApi('scan_models')" style="margin-top:15px;">FORCE SCAN</button>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = inv.map(model => {
+    const r = m.roles || {};
+    const cl = m.custom_limits || {};
+    
+    const isVoice = r.voice === model.name;
+    const isVision = r.vision === model.name;
+    const isPlan = r.planner === model.name;
+    const limits = cl[model.name] || { rpm: "-", rpd: "-" };
+
+    return `
+      <div class="model-item">
+        <div class="model-header">
+          <div>
+            <div class="model-name">${model.display_name}</div>
+            <div class="model-id">${model.name}</div>
+          </div>
+        </div>
+        <div class="model-roles">
+          <div class="role-badge ${isVoice?'active':''}" onclick="toggleRole('${model.name}', 'voice')">VOICE</div>
+          <div class="role-badge ${isPlan?'active':''}" onclick="toggleRole('${model.name}', 'planner')">PLANNER</div>
+          <div class="role-badge ${isVision?'active':''}" onclick="toggleRole('${model.name}', 'vision')">VISION</div>
+        </div>
+        <div class="model-limits">
+          <div class="limit-item">RPM <input type="text" class="limit-val" value="${limits.rpm}" onchange="updateLimit('${model.name}', 'rpm', this.value)"></div>
+          <div class="limit-item">RPD <input type="text" class="limit-val" value="${limits.rpd}" onchange="updateLimit('${model.name}', 'rpd', this.value)"></div>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+window.toggleRole = async (modelId, role) => {
+  if (S.models.roles[role] === modelId) {
+    S.models.roles[role] = ""; // Toggle off
+  } else {
+    S.models.roles[role] = modelId;
+  }
+  renderModelList();
+  await callApi("save_model_config", S.models);
+};
+
+window.updateLimit = async (modelId, type, val) => {
+  if (!S.models.custom_limits[modelId]) S.models.custom_limits[modelId] = {};
+  S.models.custom_limits[modelId][type] = val;
+  await callApi("save_model_config", S.models);
 };
 $("btn-save-key").onclick=async()=>{
   const key=$("api-key-input").value.trim();
@@ -656,6 +796,9 @@ $("btn-autostart").onclick=async()=>{
   if(r && r.status==="building"){
     b.innerHTML='<svg viewBox="0 0 24 24" class="spin-icon" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg> BUILDING';
     b.className="btn btn-toggle loading";
+    // Lift log panel above settings modal during build
+    const logPanel = document.querySelector(".log-panel");
+    if (logPanel) logPanel.style.zIndex = "16000";
   } else if(r) {
     setAutoBtn(r.enabled);
   }
@@ -667,6 +810,9 @@ function setAutoBtn(on){
     ?'<svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;stroke-width:2;fill:none"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> ON'
     :'<svg viewBox="0 0 24 24" width="14" height="14" style="stroke:currentColor;stroke-width:2;fill:none"><circle cx="12" cy="12" r="10"/></svg> OFF';
   b.className="btn btn-toggle "+(on?"on":"off");
+  // Reset log panel z-index after build completes
+  const logPanel = document.querySelector(".log-panel");
+  if (logPanel) logPanel.style.zIndex = "";
 }
 function applySettings(d){if(d.api_key)$("api-key-input").value=d.api_key;setAutoBtn(d.autostart||false);}
 
@@ -674,6 +820,7 @@ function applySettings(d){if(d.api_key)$("api-key-input").value=d.api_key;setAut
 window._onSetupRequired = (data) => {
   const overlay = document.getElementById("setup-screen");
   if (overlay) {
+    overlay.style.opacity = "1";
     overlay.style.display = "flex";
     if (data && data.has_key) {
       document.getElementById("setup-api-key").style.display = "none";
@@ -683,23 +830,75 @@ window._onSetupRequired = (data) => {
     }
   }
 };
+window._onSetupOk = () => {
+  const el = document.getElementById("setup-screen");
+  if (el) {
+    el.style.opacity = "0";
+    el.style.transition = "opacity 0.5s ease";
+    setTimeout(() => { el.style.display = "none"; }, 500);
+  }
+};
 
 $("setup-btn").onclick=async()=>{
   const lang = $("setup-language").value.trim() || "English";
   const key  = $("setup-api-key").style.display !== "none" ? $("setup-api-key").value.trim() : null;
+  
+  const btn = $("setup-btn");
+  const desc = $("setup-desc");
+  const oldText = btn.innerText;
+  btn.innerText = "SAVING...";
+  
   const payload = { language: lang, api_key: key };
   const r = await callApi("start_session", payload);
-  if(r) window._onSetupOk();
+  
+  if (r && r.success === true) {
+    window._onSetupOk();
+  } else if (r && r.success === false) {
+    desc.innerText = "Failed to save: " + (r.error || "Unknown error");
+    desc.style.color = "#f87171";
+    btn.innerText = oldText;
+  } else {
+    btn.innerText = oldText;
+  }
 };
 
-/* ═══════ SLEEP MODE ═══════ */
+$("btn-change-language").onclick = async () => {
+  await callApi("clear_language");
+  
+  const setupOverlay = document.getElementById("setup-screen");
+  if (setupOverlay) {
+    // Reveal the setup screen (z-index handled in CSS at 20000, above settings modal at 15000)
+    setupOverlay.style.opacity = "1";
+    setupOverlay.style.display = "flex";
+    
+    // Customize for re-configuration mode
+    document.getElementById("setup-api-key").style.display = "none";
+    document.getElementById("setup-title").innerText = "RECONFIGURE LANGUAGE";
+    document.getElementById("setup-desc").innerText = "Update your communication language.";
+    document.getElementById("setup-btn").innerText = "UPDATE";
+    
+    // Reset and focus the input
+    const langInp = document.getElementById("setup-language");
+    langInp.value = "";
+    langInp.placeholder = "New language...";
+    langInp.focus();
+  }
+};
+
+/* ═══════ SLEEP / WAKE MODE ═══════ */
 $("btn-sleep").onclick=async()=>{
-  await callApi("sleep_mode");
+  if (isMobile && S.isSleeping) {
+    // Mobile wake-up button pressed
+    await callApi("wake_up");
+  } else {
+    await callApi("sleep_mode");
+  }
 };
 window._onWakeUp = function() {
   // Backend triggers this when wake word detected
   S.statusText = "CONNECTING";
   S.connState = "CONNECTING";
+  S.isSleeping = false;
 };
 
 /* ═══════ INIT ═══════ */

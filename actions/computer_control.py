@@ -195,6 +195,27 @@ def _click(x: int = None, y: int = None, button: str = "left",
 def _hotkey(*keys) -> str:
     """Presses a key combination. E.g. hotkey('ctrl', 'c')"""
     _ensure_pyautogui()
+    
+    # ── SAFEGUARD: Prevent JARVIS from suicide via Alt+F4 ──
+    kl = [str(k).lower() for k in keys]
+    if "alt" in kl and "f4" in kl:
+        if platform.system() == "Windows":
+            import ctypes
+            try:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.upper()
+                if "J.A.R.V.I.S" in title or "MAIN.PY" in title or "MAIN.EXE" in title:
+                    # JARVIS is focused! Don't commit suicide.
+                    # Send Alt+Esc to push JARVIS to background, then Alt+F4 the actual intended app.
+                    pyautogui.hotkey("alt", "esc")
+                    time.sleep(0.3)
+                    # Now execute the Alt+F4 on whatever is underneath
+            except Exception:
+                pass
+
     pyautogui.hotkey(*keys)
     return f"Hotkey: {'+'.join(keys)}"
 
@@ -357,6 +378,7 @@ def _analyze_screen_for_element(description: str) -> tuple[int, int] | None:
     Takes a screenshot of ALL monitors and asks Gemini to find the
     coordinates of a described element on screen. Returns (x, y) or None.
     Multi-monitor aware: uses mss for all-monitors capture.
+    Includes retry + model fallback for 503 reliability.
     """
     try:
         from core.gemini_client import ask_with_image
@@ -398,10 +420,12 @@ def _analyze_screen_for_element(description: str) -> tuple[int, int] | None:
             f"If not found, return: NOT_FOUND"
         )
 
+        # Smart model rotation + 503 retry is handled internally by gemini_client
+        # Uses VISION chain: gemini-2.5-flash → flash-lite → 3.1-flash-lite → 3-flash
         text = ask_with_image(
             prompt, png_bytes,
             mime_type="image/png",
-            model="gemini-2.5-flash-lite"
+            model="gemini-2.5-flash"
         )
 
         if "NOT_FOUND" in text:

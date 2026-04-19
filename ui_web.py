@@ -10,23 +10,53 @@ import sys
 import subprocess
 import shutil
 
-class _DummyWriter:
-    def write(self, *args, **kwargs): pass
-    def flush(self): pass
-    def reconfigure(self, *args, **kwargs): pass
+class _FileDebugWriter:
+    def __init__(self, prefix=""):
+        self.prefix = prefix
+        self.buffer = ""
+        # Create file if missing
+        try:
+            with open("JARVIS_DEBUG.log", "a+", encoding="utf-8") as f:
+                pass
+        except Exception:
+            pass
 
-try:
-    print("", end="")
-    _stdout_encoding = getattr(sys.stdout, 'encoding', None)
-    if _stdout_encoding and hasattr(sys.stdout, 'reconfigure') and _stdout_encoding.lower() != 'utf-8':
-        sys.stdout.reconfigure(encoding='utf-8')
-except Exception:
-    sys.stdout = _DummyWriter()
+    def write(self, s):
+        try:
+            if isinstance(s, bytes): s = s.decode("utf-8", "ignore")
+            self.buffer += s
+            if "\n" in self.buffer:
+                lines = self.buffer.split("\n")
+                self.buffer = lines.pop()
+                with open("JARVIS_DEBUG.log", "a", encoding="utf-8") as f:
+                    for line in lines:
+                        if line.strip(): f.write(f"{self.prefix} {line}\n")
+        except Exception:
+            pass
 
-try:
-    print("", file=sys.stderr, end="")
-except Exception:
-    sys.stderr = _DummyWriter()
+    def flush(self):
+        pass
+
+    def reconfigure(self, *args, **kwargs):
+        pass
+
+# Force pipe everything to debug file if we are in .exe or can't reliably print
+if getattr(sys, "frozen", False):
+    sys.stdout = _FileDebugWriter("[STDOUT]")
+    sys.stderr = _FileDebugWriter("[STDERR]")
+else:
+    try:
+        print("", end="")
+        _stdout_encoding = getattr(sys.stdout, 'encoding', None)
+        if _stdout_encoding and hasattr(sys.stdout, 'reconfigure') and _stdout_encoding.lower() != 'utf-8':
+            sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        sys.stdout = _FileDebugWriter("[STDOUT]")
+    
+    try:
+        print("", file=sys.stderr, end="")
+    except Exception:
+        sys.stderr = _FileDebugWriter("[STDERR]")
 
 import json
 import time
@@ -36,6 +66,9 @@ from collections import deque
 
 import asyncio
 from aiohttp import web
+
+# ── Constants ──
+PORT = 5050
 
 # ── Paths ──
 def _get_bundle_dir():
@@ -55,11 +88,17 @@ BASE_DIR   = Path(__file__).resolve().parent
 CONFIG_DIR = USER_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
 STATIC_DIR = BUNDLE_DIR / "static"
+DEBUG_FILE = USER_DIR / "JARVIS_DEBUG.log"
 
-PORT = 5050
+
+from core.logger import logger
+from core.gemini_client import ModelRegistry
 
 try:
     import winreg
+    import win32gui
+    import win32con
+    import win32api
     _HAS_WINREG = True
 except ImportError:
     _HAS_WINREG = False
@@ -98,30 +137,85 @@ class _JarvisApi:
             return {"success": False, "error": str(e)}
 
     def start_session(self, payload):
-        lang = payload.get("language", "English").strip()
-        key  = payload.get("api_key")
-        
-        self._ui.spoken_language = lang
-        
-        if key:
-            key = key.strip()
-            try:
+        logger.log("API", f"start_session called: {payload.get('language')}", level="SYS")
+        try:
+            lang = payload.get("language", "English").strip()
+            key  = payload.get("api_key")
+            
+            # The property is now read-only and backed by the config file
+            
+            if key:
+                key = key.strip()
                 os.makedirs(CONFIG_DIR, exist_ok=True)
                 with open(API_FILE, "w", encoding="utf-8") as f:
                     json.dump({"gemini_api_key": key}, f, indent=4)
-                self._ui._api_key_ready = True
-            except Exception:
-                return False
-                
-        self._ui._language_ready = True
-        self._ui.status_text = "ONLINE"
-        self._ui.write_log(f"SYS: Systems initialised. Configuration: {lang}.")
-        return True
+                logger.log("API", "API key written to disk successfully", level="AUTH")
+            
+            # Save language to config for persistence
+            config = ModelRegistry.get_config()
+            config["language"] = lang
+            ModelRegistry.save_config(config)
+            
+            # --- Smart Boot: Auto-align models to roles ---
+            self._ui.write_log("SYS: Scanning available models and optimizing model alignment for your API profile...")
+            ModelRegistry.scan_models()
+            ModelRegistry.auto_align_roles()
+            
+            logger.state(f"Systems initialised. Configuration: {lang}.", icon="✅")
+            self._ui.write_log(f"SYS: Systems initialised. Configuration: {lang}.")
+            
+            # Broadcast OK to all clients
+            self._ui._broadcast({"type": "setup_ok"})
+            self._ui.needs_restart = True
+            return {"success": True}
+        except Exception as e:
+            logger.log("API", f"start_session error: {e}", level="ERR")
+            return {"success": False, "error": str(e)}
 
     def sleep_mode(self):
         """Called from JS — puts JARVIS to sleep."""
         self._ui.enter_sleep()
         return True
+
+    def wake_up(self):
+        """Called from JS — wakes JARVIS from sleep."""
+        if self._ui.is_sleeping:
+            self._ui.write_log("SYS: Wake button pressed. Reconnecting...")
+            self._ui.wake_up()
+        return True
+
+    def setup_api_key(self, key):
+        """Alternative to save_api_key — used during initial setup."""
+        return self.save_api_key(key)
+
+    def get_model_inventory(self):
+        return ModelRegistry.get_config()
+
+    def scan_models(self):
+        inventory = ModelRegistry.scan_models()
+        # Proactively align roles after a scan
+        ModelRegistry.auto_align_roles()
+        return {"success": True, "count": len(inventory)}
+
+    def save_model_config(self, data):
+        try:
+            config = ModelRegistry.get_config()
+            if "roles" in data: config["roles"] = data["roles"]
+            if "chains" in data: config["chains"] = data["chains"]
+            if "custom_limits" in data: config["custom_limits"] = data["custom_limits"]
+            ModelRegistry.save_config(config)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def clear_language(self):
+        try:
+            config = ModelRegistry.get_config()
+            config["language"] = ""
+            ModelRegistry.save_config(config)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def toggle_autostart(self):
         cur = self._ui._get_autostart()
@@ -205,12 +299,11 @@ class JarvisUI:
         self._conn_state    = "CONNECTING"
         self._status_text   = "INITIALISING"
         self.is_building    = False
+        self.needs_restart  = False
         self.last_audio_played_time = 0.0
 
         self._log_queue: deque = deque(maxlen=200)
-        self._api_key_ready = self._api_keys_exist()
-        self._language_ready = False
-        self.spoken_language = "English"
+        
         self._log_counter   = 0
         self._window        = None
         self._window_ready  = False
@@ -244,7 +337,7 @@ class JarvisUI:
     def speaking(self, val):
         if val != self._speaking:
             self._speaking = val
-            print(f"[STATE] {'🔊 Speaking ON' if val else '🔇 Speaking OFF'}")
+            logger.state(f"{'🔊 Speaking ON' if val else '🔇 Speaking OFF'}", icon="🔊" if val else "🔇")
 
     @property
     def conn_state(self):
@@ -255,7 +348,7 @@ class JarvisUI:
         if val != self._conn_state:
             self._conn_state = val
             icons = {"CONNECTING": "🔌", "ONLINE": "✅", "RECONNECTING": "🔄", "FAILED": "❌"}
-            print(f"[STATE] {icons.get(val, '📡')} Connection → {val}")
+            logger.state(f"Connection → {val}", icon=icons.get(val, "📡"))
 
     @property
     def status_text(self):
@@ -267,7 +360,7 @@ class JarvisUI:
             self._status_text = val
             # Don't log RETRY N or minor updates to reduce noise
             if val not in ("CONNECTING",):
-                print(f"[STATE] 📊 Status → {val}")
+                logger.log("UI", f"Status → {val}", level="STATE")
 
     # ── Public API ──
     def write_log(self, text: str):
@@ -282,13 +375,19 @@ class JarvisUI:
 
         # Console logging with tag formatting
         tag_icons = {"user": "🗣️  USER", "ai": "🤖 JARVIS", "sys": "⚙️  SYS"}
-        print(f"[LOG] {tag_icons.get(tag, '📝 LOG')} │ {text}")
+        try:
+            print(f"[LOG] {tag_icons.get(tag, '📝 LOG')} │ {text}")
+        except Exception:
+            pass
 
-        # Push to JS directly (pywebview mode)
+        # Push to JS natively (in a separate thread to prevent PyWebview API deadlocks)
         safe_text = json.dumps(text)
         safe_tag  = json.dumps(tag)
         safe_id   = json.dumps(entry_id)
-        self._eval_js(f"_onLog({safe_text},{safe_tag},{safe_id})")
+        threading.Thread(
+            target=lambda: self._eval_js(f"_onLog({safe_text},{safe_tag},{safe_id})"),
+            daemon=True
+        ).start()
 
         # Broadcast to all connected WebSockets (including mobile)
         self._broadcast({"type": "log", **entry})
@@ -309,10 +408,15 @@ class JarvisUI:
         print(f"[STATE] 🔇 Speaking → OFF | Status → ONLINE")
 
     def wait_for_api_key(self):
-        print(f"[STATE] 🔑 Waiting for session configuration...")
+        logger.log("SYS", f"Checking boot-gate: API Key: {self._api_key_ready}, Language: {self._language_ready}", level="SYS")
+        if not (self._api_key_ready and self._language_ready):
+            logger.state("Waiting for session configuration...", icon="🔑")
+            
         while not (self._api_key_ready and self._language_ready):
             time.sleep(0.1)
-        print(f"[STATE] ✅ Session configured")
+            
+        # Refresh configuration once ready to ensure all properties have latest data
+        logger.state("Session configured", icon="✅")
 
     # ── Sleep / Wake ──
     def enter_sleep(self):
@@ -361,14 +465,38 @@ class JarvisUI:
             self._woken_event.set()
 
     @property
-    def is_sleeping(self) -> bool:
+    def is_sleeping(self):
         return self._sleep_event.is_set()
+
+    @property
+    def _api_key_ready(self):
+        return self._api_keys_exist()
+
+    @property
+    def spoken_language(self):
+        try:
+            config = ModelRegistry.get_config()
+            return config.get("language", "English")
+        except Exception:
+            return "English"
+
+    @property
+    def _language_ready(self):
+        try:
+            config = ModelRegistry.get_config()
+            lang = config.get("language")
+            # Strictly verify language is set and non-empty
+            return bool(lang and isinstance(lang, str) and lang.strip())
+        except Exception:
+            return False
 
     # ── evaluate_js wrapper ──
     def _eval_js(self, code):
         if self._window and self._window_ready:
             try:
-                self._window.evaluate_js(code)
+                # We offload UI JS evaluations (like one-off setups) to a thread
+                # to guarantee they NEVER deadlock a Pywebview Native UI hook.
+                threading.Thread(target=lambda: self._window.evaluate_js(code), daemon=True).start()
             except Exception:
                 self._window_ready = False
 
@@ -376,25 +504,18 @@ class JarvisUI:
     def _push_state_loop(self):
         try:
             """Called by webview.start(func=...) in a separate thread."""
-            time.sleep(1.5)  # Wait for page + JS to fully load
+            # Wait for page + JS to fully load
+            time.sleep(1.5)
             self._window_ready = True
 
-            # Always mandate the Setup screen on component load
-            # It will dynamically hide the API key field if _api_key_ready is already True
-            safe_has_key = str(self._api_key_ready).lower()
-            self._eval_js(f"_onSetupRequired({{'has_key': {safe_has_key}}})")
+            # Only mandate the Setup config screen if config is actually missing
+            if not (self._api_key_ready and self._language_ready):
+                safe_has_key = str(self._api_key_ready).lower()
+                self._eval_js(f"_onSetupRequired({{'has_key': {safe_has_key}}})")
 
-            # Replay existing logs (only those queued before window was ready)
-            for entry in list(self._log_queue):
-                safe_text = json.dumps(entry["text"])
-                safe_tag  = json.dumps(entry.get("tag", "sys"))
-                safe_id   = json.dumps(entry.get("id", ""))
-                self._eval_js(f"_onLog({safe_text},{safe_tag},{safe_id})")
-                time.sleep(0.05)
-
-            # Continuous state push
+            # Continuous state push via extremely fast local WebSocket
             while self._window_ready:
-                state = json.dumps({
+                state = {
                     "speaking":     self.speaking,
                     "mic_level":    round(self.mic_level, 4),
                     "jarvis_level": round(self.jarvis_level, 4),
@@ -402,11 +523,11 @@ class JarvisUI:
                     "status_text":  self.status_text,
                     "is_building":  self.is_building,
                     "mobile_connected": self.mobile_connected,
-                })
-                self._eval_js(f"_onState({state})")
+                }
+                self._broadcast({"type": "state", **state})
                 time.sleep(1 / 30)
         except Exception as e:
-            print(f"[FATAL] _push_state_loop crashed: {e}")
+            logger.log("UI", f"_push_state_loop crashed: {e}", level="ERR")
 
     # ── aiohttp (static files + WS fallback) ──
     def _run_server(self):
@@ -428,7 +549,7 @@ class JarvisUI:
             key_path = CONFIG_DIR / "key.pem"
 
             if not cert_path.exists() or not key_path.exists():
-                print("[UI] 🔐 Generating Ephemeral Self-Signed SSL Certificate for Mobile WebRTC...")
+                logger.log("SSL", "Generating Ephemeral Self-Signed SSL Certificate...", level="SYS")
                 key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
                 subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, u"JARVIS Localhost")])
                 cert = x509.CertificateBuilder().subject_name(
@@ -462,7 +583,7 @@ class JarvisUI:
             ssl_context.load_cert_chain(str(cert_path), str(key_path))
             return ssl_context
         except Exception as e:
-            print(f"[UI] ⚠️ Failed to generate SSL Certificate. HTTPS will be disabled. Error: {e}")
+            logger.log("SSL", f"Failed to generate SSL Certificate. HTTPS will be disabled. Error: {e}", level="WARN")
             return None
 
     @web.middleware
@@ -531,8 +652,8 @@ class JarvisUI:
         proto_str = "https" if ssl_ctx else "http"
         ip_display = " or ".join([f"{proto_str}://{ip}:{MOBILE_PORT}" for ip in best_ips])
             
-        print(f"[UI] Desktop Core running on http://127.0.0.1:{PORT}")
-        print(f"[UI] 📱 Mobile Assistant slot open! Connect your phone to: {ip_display}")
+        logger.log("UI", f"Desktop Core running on http://127.0.0.1:{PORT}", level="SYS")
+        logger.log("UI", f"Mobile Assistant slot open! Connect your phone to: {ip_display}", level="SYS")
         self._server_ready.set()
 
         async def _mobile_audio_sender():
@@ -582,7 +703,7 @@ class JarvisUI:
             self._mobile_ip = req.remote
             self.mobile_connected = True
             self.mobile_locked = True
-            print("[UI] 📱 Mobile device connected and took control.")
+            logger.log("UI", "Mobile device connected and took control.", level="LIVE")
             while not self.mobile_mic_queue.empty():
                 try: self.mobile_mic_queue.get_nowait()
                 except asyncio.QueueEmpty: break
@@ -607,8 +728,16 @@ class JarvisUI:
             "is_building": self.is_building,
             "mobile_connected": self.mobile_connected,
         })
-        if not (self._api_key_ready and self._language_ready):
-            await ws.send_json({"type": "setup_required", "has_key": self._api_key_ready})
+        # [DEBUG] Log setup gate decision
+        setup_needed = not self._api_key_ready or not self._language_ready
+        logger.log("UI", f"Handshake check: API_READY={self._api_key_ready}, LANG_READY={self._language_ready} -> SETUP_NEEDED={setup_needed}", level="SYS")
+
+        if setup_needed:
+            await ws.send_json({
+                "type": "setup_required", 
+                "has_key": self._api_key_ready,
+                "lang_ready": self._language_ready
+            })
         else:
             await ws.send_json({"type": "setup_ok"})
 
@@ -632,16 +761,45 @@ class JarvisUI:
             if device_type == "mobile":
                 self._mobile_ws = None
                 self.mobile_connected = False
-                print("[UI] 📱 Mobile device disconnected. Control returned to laptop.")
+                logger.log("UI", "Mobile device disconnected. Control returned to laptop.", level="LIVE")
             else:
                 self._desktop_ws = None
-                print("[UI] 💻 Desktop UI disconnected.")
+                logger.log("UI", "Desktop UI disconnected.", level="SYS")
 
         return ws
 
     async def _handle_ws(self, ws, d):
         t = d.get("type", "")
-        if t == "get_settings":
+        if t == "get_model_inventory":
+            # Proactively align roles and scan if inventory is missing
+            config = ModelRegistry.get_config()
+            if not config.get("inventory"):
+                logger.log("SYS", "Initial boot: Scanning available models...", level="SYS")
+                ModelRegistry.scan_models()
+                config = ModelRegistry.get_config()
+                
+            if not config.get("roles"):
+                ModelRegistry.auto_align_roles()
+                config = ModelRegistry.get_config()
+            await ws.send_json({"type": "model_inventory", **config})
+        elif t == "scan_models":
+            inventory = ModelRegistry.scan_models()
+            ModelRegistry.auto_align_roles()
+            await ws.send_json({"type": "scan_result", "success": True, "count": len(inventory)})
+            # Force AI reconnect with updated model assignments
+            self.needs_restart = True
+        elif t == "save_model_config":
+            payload = d.get("data", {})
+            try:
+                config = ModelRegistry.get_config()
+                if "roles" in payload: config["roles"] = payload["roles"]
+                if "chains" in payload: config["chains"] = payload["chains"]
+                if "custom_limits" in payload: config["custom_limits"] = payload["custom_limits"]
+                ModelRegistry.save_config(config)
+                await ws.send_json({"type": "save_config_result", "success": True})
+            except Exception as e:
+                await ws.send_json({"type": "save_config_result", "success": False, "error": str(e)})
+        elif t == "get_settings":
             key = ""
             if API_FILE.exists():
                 try:
@@ -662,30 +820,64 @@ class JarvisUI:
                 await ws.send_json({"type": "save_result", "success": True})
             except Exception as e:
                 await ws.send_json({"type": "save_result", "success": False, "error": str(e)})
+        elif t == "clear_language":
+            try:
+                config = ModelRegistry.get_config()
+                config["language"] = ""
+                ModelRegistry.save_config(config)
+                await ws.send_json({"type": "clear_language_result", "success": True})
+            except Exception as e:
+                await ws.send_json({"type": "clear_language_result", "success": False, "error": str(e)})
         elif t == "start_session":
             payload = d.get("payload", {})
             lang = payload.get("language", "English").strip()
             key  = payload.get("api_key")
             
-            self.spoken_language = lang
+            logger.log("UI", f"start_session called via WS: lang={lang}", level="SYS")
             
             if key:
                 key = key.strip()
                 os.makedirs(CONFIG_DIR, exist_ok=True)
                 with open(API_FILE, "w", encoding="utf-8") as f:
                     json.dump({"gemini_api_key": key}, f, indent=4)
-                self._api_key_ready = True
-                
-            self._language_ready = True
+                logger.log("AUTH", "API key saved successfully.", level="AUTH")
+            
+            # Save to config
+            config = ModelRegistry.get_config()
+            config["language"] = lang
+            ModelRegistry.save_config(config)
+            
+            # Auto-align
+            self.write_log("SYS: Optimizing model alignment for your API profile...")
+            ModelRegistry.auto_align_roles()
+            
             self._broadcast({"type": "setup_ok"})
-            self.status_text = "ONLINE"
+            logger.state(f"Systems initialised. Configuration: {lang}.", icon="✅")
             self.write_log(f"SYS: Systems initialised. Configuration: {lang}.")
+            # Response to sender
+            await ws.send_json({"type": "save_result", "success": True})
+        elif t == "check_setup":
+            # Mandatory boot-gate check
+            if not (self._api_key_ready and self._language_ready):
+                logger.log("UI", "Setup required (Key or Language missing)", level="AUTH")
+                await ws.send_json({
+                    "type": "setup_required", 
+                    "has_key": self._api_key_ready,
+                    "lang_ready": self._language_ready
+                })
+            else:
+                logger.log("UI", "Handshake OK", level="SYS")
+                await ws.send_json({"type": "setup_ok"})
         elif t == "toggle_autostart":
             cur = self._get_autostart()
             ok  = self._set_autostart(not cur)
             await ws.send_json({"type": "autostart_result", "enabled": (not cur) if ok else cur})
         elif t == "sleep_mode":
             self.enter_sleep()
+        elif t == "wake_up":
+            if self.is_sleeping:
+                self.write_log("SYS: Mobile wake button pressed. Reconnecting...")
+                self.wake_up()
 
     async def _broadcast_async(self, data):
         dead = []
@@ -701,9 +893,15 @@ class JarvisUI:
             asyncio.run_coroutine_threadsafe(self._broadcast_async(data), self._loop)
 
     # ── API key ──
-    @staticmethod
-    def _api_keys_exist():
-        return API_FILE.exists()
+    def _api_keys_exist(self):
+        if not API_FILE.exists():
+            return False
+        try:
+            with open(API_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return bool(data.get("gemini_api_key"))
+        except Exception:
+            return False
 
     # ── Auto-start ──
     def _get_autostart(self):
@@ -789,7 +987,7 @@ Comment=Jarvis AI Assistant
         try:
             import webview
         except ImportError:
-            print("[UI] pywebview not installed - opening in browser")
+            logger.log("UI", "pywebview not installed - opening in browser", level="WARN")
             import webbrowser
             webbrowser.open(f"http://127.0.0.1:{PORT}")
             try:
@@ -826,6 +1024,30 @@ Comment=Jarvis AI Assistant
         self._window.events.restored += _on_restored
         self._window.events.maximized += _on_restored
         self._window.events.shown += _on_restored
+
+        def _apply_native_icon():
+            """Native Windows workaround to set window icon if pywebview fails."""
+            if sys.platform != "win32" or not _HAS_WINREG: return
+            icon_path = str(STATIC_DIR / "icon.ico")
+            if not os.path.exists(icon_path): return
+            
+            for _ in range(20): # Try for 10 seconds
+                hwnd = win32gui.FindWindow(None, "J.A.R.V.I.S")
+                if hwnd:
+                    try:
+                        # Load the icon
+                        icon_handle = win32gui.LoadImage(
+                            0, icon_path, win32con.IMAGE_ICON, 
+                            0, 0, win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE
+                        )
+                        # Set big and small icons
+                        win32gui.SendMessage(hwnd, win32con.WM_SETICON, win32con.ICON_BIG, icon_handle)
+                        win32gui.SendMessage(hwnd, win32con.WM_SETICON, win32con.ICON_SMALL, icon_handle)
+                        return
+                    except Exception: pass
+                time.sleep(0.5)
+
+        threading.Thread(target=_apply_native_icon, daemon=True).start()
         
         webview.start(func=self._push_state_loop, debug=False)
         os._exit(0)
